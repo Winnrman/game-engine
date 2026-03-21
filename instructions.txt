@@ -1,0 +1,2 @@
+step 1. run cmake --build build to build the project
+step 2. .\build\MyEngine.exe to run the executable
