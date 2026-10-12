@@ -95,6 +95,8 @@ enum Block : uint8_t {
     DIAMOND_ORE, EMERALD_ORE,
     FURNACE_PX, FURNACE_NX, FURNACE_PZ, FURNACE_NZ,                 // front facing +X/-X/+Z/-Z
     LIT_FURNACE_PX, LIT_FURNACE_NX, LIT_FURNACE_PZ, LIT_FURNACE_NZ, // same, while burning
+    SPRUCE_LOG, SPRUCE_LEAVES, SPRUCE_PLANKS, BIRCH_LOG, BIRCH_LEAVES, BIRCH_PLANKS,
+    CACTUS, SNOW, SNOW_BLOCK, ICE,                                   // SNOW is the thin layer
     BLOCK_COUNT
 };
 
@@ -109,7 +111,12 @@ enum Tile {
     T_CRACK0 = 32,  // 10 crack stages: 32..41
     T_EMERALD_ORE = 42, T_DIAMOND, T_EMERALD,
     T_IRON_INGOT, T_IRON_PICKAXE, T_IRON_AXE, T_IRON_SHOVEL, T_IRON_SWORD,
-    T_FURNACE_FRONT, T_FURNACE_FRONT_LIT, T_FURNACE_SIDE, T_FURNACE_TOP
+    T_FURNACE_FRONT, T_FURNACE_FRONT_LIT, T_FURNACE_SIDE, T_FURNACE_TOP,
+    T_GRASS_OVERLAY,     // the grassy fringe on grass block sides, tinted by biome
+    T_GRASS_SNOW_SIDE, T_SPRUCE_LOG, T_SPRUCE_LOG_TOP, T_SPRUCE_LEAVES, T_SPRUCE_PLANKS,
+    T_BIRCH_LOG, T_BIRCH_LOG_TOP, T_BIRCH_LEAVES, T_BIRCH_PLANKS,
+    T_CACTUS_SIDE, T_CACTUS_TOP, T_CACTUS_BOTTOM, T_SNOW, T_ICE,
+    TILE_COUNT
 };
 
 // Which tool mines a block faster (and, for pickaxe blocks, at all)
@@ -163,12 +170,28 @@ inline const BlockInfo& Info(uint8_t b) {
         {"Furnace",        "lit_furnace_nx", 3.5,  true,  true,  true,  false, T_FURNACE_TOP, T_FURNACE_SIDE, T_FURNACE_TOP, PICKAXE, 0},
         {"Furnace",        "lit_furnace_pz", 3.5,  true,  true,  true,  false, T_FURNACE_TOP, T_FURNACE_SIDE, T_FURNACE_TOP, PICKAXE, 0},
         {"Furnace",        "lit_furnace_nz", 3.5,  true,  true,  true,  false, T_FURNACE_TOP, T_FURNACE_SIDE, T_FURNACE_TOP, PICKAXE, 0},
+        {"Spruce Log",     "spruce_log",     2.0,  false, true,  true,  false, T_SPRUCE_LOG_TOP, T_SPRUCE_LOG, T_SPRUCE_LOG_TOP, AXE, 0},
+        {"Spruce Leaves",  "spruce_leaves",  0.2,  false, true,  false, false, T_SPRUCE_LEAVES, T_SPRUCE_LEAVES, T_SPRUCE_LEAVES, NO_TOOL, 0},
+        {"Spruce Planks",  "spruce_planks",  2.0,  false, true,  true,  false, T_SPRUCE_PLANKS, T_SPRUCE_PLANKS, T_SPRUCE_PLANKS, AXE, 0},
+        {"Birch Log",      "birch_log",      2.0,  false, true,  true,  false, T_BIRCH_LOG_TOP, T_BIRCH_LOG, T_BIRCH_LOG_TOP, AXE, 0},
+        {"Birch Leaves",   "birch_leaves",   0.2,  false, true,  false, false, T_BIRCH_LEAVES, T_BIRCH_LEAVES, T_BIRCH_LEAVES, NO_TOOL, 0},
+        {"Birch Planks",   "birch_planks",   2.0,  false, true,  true,  false, T_BIRCH_PLANKS, T_BIRCH_PLANKS, T_BIRCH_PLANKS, AXE, 0},
+        {"Cactus",         "cactus",         0.4,  false, true,  false, false, T_CACTUS_TOP, T_CACTUS_SIDE, T_CACTUS_BOTTOM, NO_TOOL, 0},
+        {"Snow",           "snow",           0.1,  true,  false, false, false, T_SNOW,      T_SNOW,       T_SNOW,    SHOVEL,  0},
+        {"Snow Block",     "snow_block",     0.2,  true,  true,  true,  false, T_SNOW,      T_SNOW,       T_SNOW,    SHOVEL,  0},
+        {"Ice",            "ice",            0.5,  false, true,  false, true,  T_ICE,       T_ICE,        T_ICE,     PICKAXE, 0},
     };
     return table[b < BLOCK_COUNT ? b : 0];
 }
 
+inline bool IsLeaves(uint8_t b) { return b == LEAVES || b == SPRUCE_LEAVES || b == BIRCH_LEAVES; }
+inline bool IsLog(uint8_t b)    { return b == LOG || b == SPRUCE_LOG || b == BIRCH_LOG; }
+
 // Blocks that stop skylight from falling straight down (used for spawning)
-inline bool BlocksSky(uint8_t b) { return Info(b).opaque || b == LEAVES; }
+inline bool BlocksSky(uint8_t b) { return Info(b).opaque || IsLeaves(b); }
+
+// Ice is slippery; everything else has Minecraft's default friction
+inline double Slipperiness(uint8_t b) { return b == ICE ? 0.98 : 0.6; }
 
 // ---------------------------------------------------------------------------
 // Torches
@@ -199,7 +222,7 @@ inline uint8_t TorchForFace(int nx, int ny, int nz) {
 }
 
 // Can a torch hang on this block?
-inline bool CanHoldTorch(uint8_t b) { return Info(b).solid && b != LEAVES && !IsTorch(b); }
+inline bool CanHoldTorch(uint8_t b) { return Info(b).solid && !IsLeaves(b) && !IsTorch(b) && b != CACTUS && b != ICE; }
 
 // ---------------------------------------------------------------------------
 // Furnaces: 4 facings x lit/unlit. FURNACE_PX doubles as the furnace item.
@@ -292,7 +315,8 @@ inline int MaxDurability(uint8_t item) { const ItemInfo* d = ItemData(item); ret
 inline int FuelTicks(uint8_t item) {
     switch (item) {
         case COAL:                                            return 1600;
-        case LOG: case PLANKS: case CRAFTING_TABLE: case CRATE: return 300;
+        case LOG: case PLANKS: case CRAFTING_TABLE: case CRATE:
+        case SPRUCE_LOG: case SPRUCE_PLANKS: case BIRCH_LOG: case BIRCH_PLANKS: return 300;
         case WOODEN_PICKAXE: case WOODEN_AXE: case WOODEN_SHOVEL: case WOODEN_SWORD: return 200;
         case STICK:                                           return 100;
         default:                                              return 0;
@@ -318,7 +342,7 @@ inline bool ItemByKey(const char* key, uint8_t& out) {
 inline double ToolSpeed(uint8_t block, uint8_t tool) {
     const ItemInfo* t = ItemData(tool);
     if (!t || t->tool == NO_TOOL) return 1.0;
-    if (t->tool == SWORD) return block == LEAVES ? 1.5 : 1.0;
+    if (t->tool == SWORD) return IsLeaves(block) || block == CACTUS ? 1.5 : 1.0;
     return t->tool == Info(block).tool ? t->speed : 1.0;
 }
 
@@ -420,15 +444,63 @@ struct Perlin {
 };
 
 // ---------------------------------------------------------------------------
+// Biomes, with Minecraft's grass, foliage and water colors (0xRRGGBB)
+// ---------------------------------------------------------------------------
+enum Biome : uint8_t {
+    OCEAN, FROZEN_OCEAN, BEACH, PLAINS, FOREST, BIRCH_FOREST, TAIGA, SNOWY_PLAINS,
+    DESERT, SWAMP, MOUNTAINS,
+    BIOME_COUNT
+};
+
+struct BiomeInfo {
+    const char* name;
+    uint32_t grass, foliage, water;
+    bool snowy;   // snow lies on the ground and water freezes
+};
+
+inline const BiomeInfo& BiomeData(uint8_t b) {
+    static const BiomeInfo table[BIOME_COUNT] = {
+        {"Ocean",         0x8EB971, 0x71A74D, 0x3F76E4, false},
+        {"Frozen Ocean",  0x80B497, 0x60A17B, 0x3938C9, true},
+        {"Beach",         0x91BD59, 0x77AB2F, 0x3F76E4, false},
+        {"Plains",        0x91BD59, 0x77AB2F, 0x3F76E4, false},
+        {"Forest",        0x79C05A, 0x59AE30, 0x3F76E4, false},
+        {"Birch Forest",  0x88BB67, 0x6BA941, 0x3F76E4, false},
+        {"Taiga",         0x86B783, 0x68A464, 0x287082, false},
+        {"Snowy Plains",  0x80B497, 0x60A17B, 0x3D57D6, true},
+        {"Desert",        0xBFB755, 0xAEA42A, 0x32A598, false},
+        {"Swamp",         0x6A7039, 0x6A7039, 0x617B64, false},
+        {"Mountains",     0x8AB689, 0x6DA36B, 0x3F76E4, false},
+    };
+    return table[b < BIOME_COUNT ? b : PLAINS];
+}
+
+// Spruce and birch leaves keep their own color everywhere, like in Minecraft
+constexpr uint32_t SPRUCE_FOLIAGE = 0x619961;
+constexpr uint32_t BIRCH_FOLIAGE  = 0x80A755;
+
+// ---------------------------------------------------------------------------
 // World storage
 // ---------------------------------------------------------------------------
 struct World {
     std::vector<uint8_t> blocks;   // x-major, then z, then y (columns contiguous)
     std::vector<int16_t> top;      // highest sky-blocking y per column, -1 if none
     std::vector<uint8_t> light;    // per block: sky level << 4 | block-light level (0..15 each)
+    std::vector<uint8_t> biome;    // per column
+    // Per column colors, blended across nearby biomes so borders fade
+    std::vector<uint32_t> grassColor, foliageColor, waterColor;
     uint32_t seed = 0;
 
-    World() : blocks((size_t)WX * WY * WZ, AIR), top((size_t)WX * WZ, -1), light((size_t)WX * WY * WZ, 0xF0) {}
+    World() : blocks((size_t)WX * WY * WZ, AIR), top((size_t)WX * WZ, -1), light((size_t)WX * WY * WZ, 0xF0),
+              biome((size_t)WX * WZ, PLAINS), grassColor((size_t)WX * WZ, 0x91BD59),
+              foliageColor((size_t)WX * WZ, 0x77AB2F), waterColor((size_t)WX * WZ, 0x3F76E4) {}
+
+    static size_t Col(int x, int z) { return (size_t)x * WZ + z; }
+    uint8_t BiomeAt(int x, int z) const { return InXZ(x, z) ? biome[Col(x, z)] : (uint8_t)OCEAN; }
+    // Colors with the world edge clamped
+    uint32_t GrassAt(int x, int z) const   { return grassColor[Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; }
+    uint32_t FoliageAt(int x, int z) const { return foliageColor[Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; }
+    uint32_t WaterAt(int x, int z) const   { return waterColor[Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; }
 
     static bool InXZ(int x, int z) { return x >= 0 && x < WX && z >= 0 && z < WZ; }
     static size_t Idx(int x, int y, int z) { return ((size_t)x * WZ + z) * WY + y; }
@@ -488,7 +560,7 @@ inline int LightEmission(uint8_t b) { return IsTorch(b) ? 14 : (IsLitFurnace(b) 
 inline int LightCost(uint8_t b) { return Info(b).opaque ? 15 : 1; }
 
 // Full skylight only keeps falling through clear blocks
-inline bool SkyFallsThrough(uint8_t b) { return b == AIR || b == GLASS || IsTorch(b); }
+inline bool SkyFallsThrough(uint8_t b) { return b == AIR || b == GLASS || b == SNOW || IsTorch(b); }
 
 struct LightBox {
     int x0 = 0, y0 = 0, z0 = 0, x1 = -1, y1 = -1, z1 = -1;
@@ -610,11 +682,34 @@ inline LightBox RelightAround(World& w, int x, int y, int z) {
 
 inline void RelightAll(World& w) { RelightBox(w, 0, 0, 0, WX - 1, WY - 1, WZ - 1); }
 
+// Can this block stay where it is? Torches need the block they hang on,
+// cactus needs sand (or more cactus) below and nothing solid beside it,
+// a snow layer needs a full block or leaves underneath.
+inline bool CanSurvive(const World& w, uint8_t b, int x, int y, int z) {
+    if (IsTorch(b)) {
+        int sx, sy, sz;
+        TorchSupport(b, x, y, z, sx, sy, sz);
+        return CanHoldTorch(w.Get(sx, sy, sz));
+    }
+    if (b == CACTUS) {
+        uint8_t below = w.Get(x, y - 1, z);
+        if (below != SAND && below != CACTUS) return false;
+        return !w.SolidAt(x + 1, y, z) && !w.SolidAt(x - 1, y, z) && !w.SolidAt(x, y, z + 1) && !w.SolidAt(x, y, z - 1);
+    }
+    if (b == SNOW) {
+        uint8_t below = w.Get(x, y - 1, z);
+        return (Info(below).opaque || IsLeaves(below)) && below != ICE;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Terrain generation: gentle plains with ponds, oak trees, ores, bedrock
 // ---------------------------------------------------------------------------
-inline void PlaceOakTree(World& w, int x, int baseY, int z, uint32_t seed) {
-    int h = 4 + (int)(Hash01(x, 1, z, seed + 12) * 3.0);   // trunk 4..6
+// Oak (trunk 4..6) and birch (trunk 5..7) share Minecraft's blob canopy
+inline void PlaceOakTree(World& w, int x, int baseY, int z, uint32_t seed, bool birch = false) {
+    const uint8_t LOGB = birch ? BIRCH_LOG : LOG, LEAF = birch ? BIRCH_LEAVES : LEAVES;
+    int h = (birch ? 5 : 4) + (int)(Hash01(x, 1, z, seed + 12) * 3.0);
     if (baseY + h + 1 >= WY) return;
     // Leaves: 4 layers. Bottom two are 5x5, top two are 3x3.
     // Corners are randomly trimmed, and always trimmed on the top layer.
@@ -628,11 +723,44 @@ inline void PlaceOakTree(World& w, int x, int baseY, int z, uint32_t seed) {
                     if (rel == 0) continue;
                     if (Hash01(x + dx, y, z + dz, seed + 13) < 0.5) continue;
                 }
-                if (w.Get(x + dx, y, z + dz) == AIR) w.SetRaw(x + dx, y, z + dz, LEAVES);
+                if (w.Get(x + dx, y, z + dz) == AIR) w.SetRaw(x + dx, y, z + dz, LEAF);
             }
     }
-    for (int i = 0; i < h; ++i) w.SetRaw(x, baseY + i, z, LOG);
+    for (int i = 0; i < h; ++i) w.SetRaw(x, baseY + i, z, LOGB);
     w.SetRaw(x, baseY - 1, z, DIRT);
+}
+
+// Spruce: a tall trunk wrapped in stacked, alternating rings of leaves that
+// narrow to a point, like Minecraft's spruce foliage
+inline void PlaceSpruceTree(World& w, int x, int baseY, int z, uint32_t seed) {
+    int h = 6 + (int)(Hash01(x, 2, z, seed + 14) * 4.0);          // trunk 6..9
+    int maxR = 2 + (Hash01(x, 3, z, seed + 15) < 0.4 ? 1 : 0);
+    int bare = 1 + (int)(Hash01(x, 4, z, seed + 16) * 2.0);        // bare trunk at the bottom
+    if (baseY + h + 2 >= WY) return;
+    int top = baseY + h + 1;
+    int r = 0, ring = 1;
+    for (int y = top; y >= baseY + bare; --y) {
+        for (int dx = -r; dx <= r; ++dx)
+            for (int dz = -r; dz <= r; ++dz) {
+                if (r > 0 && std::abs(dx) == r && std::abs(dz) == r) continue;   // round off corners
+                if (w.Get(x + dx, y, z + dz) == AIR) w.SetRaw(x + dx, y, z + dz, SPRUCE_LEAVES);
+            }
+        // Grow the ring each layer; when it reaches its limit, pull back in
+        if (r >= ring) { r = (ring > 1 && Hash01(x, y, z, seed + 17) < 0.5) ? 1 : 0; ring = std::min(ring + 1, maxR); }
+        else ++r;
+    }
+    for (int i = 0; i < h; ++i) w.SetRaw(x, baseY + i, z, SPRUCE_LOG);
+    w.SetRaw(x, baseY - 1, z, DIRT);
+}
+
+// Cactus grows 1-3 tall on sand, with nothing right beside it
+inline void PlaceCactus(World& w, int x, int baseY, int z, uint32_t seed) {
+    int h = 1 + (int)(Hash01(x, 5, z, seed + 18) * 3.0);
+    for (int y = baseY; y < baseY + h; ++y) {
+        if (w.Get(x, y, z) != AIR) return;
+        if (w.Get(x + 1, y, z) != AIR || w.Get(x - 1, y, z) != AIR || w.Get(x, y, z + 1) != AIR || w.Get(x, y, z - 1) != AIR) return;
+        w.SetRaw(x, y, z, CACTUS);
+    }
 }
 
 // Seeded random numbers for world generation, so a seed always builds the
@@ -785,42 +913,184 @@ inline void PlaceOres(World& w, uint32_t seed) {
         }
 }
 
+inline double SmoothStep(double a, double b, double x) {
+    double t = std::max(0.0, std::min(1.0, (x - a) / (b - a)));
+    return t * t * (3 - 2 * t);
+}
+
+// The climate at a column: these smooth noise fields shape the terrain and
+// pick the biome, so neighbouring columns always agree and there are no seams
+struct Climate {
+    double continent, temperature, humidity, mountain, ridge, detail;
+};
+
+struct ClimateNoise {
+    Perlin cont, temp, humid, mount, ridge, detail;
+    explicit ClimateNoise(uint32_t seed)
+        : cont(seed), temp(seed * 31u + 7u), humid(seed * 131u + 17u), mount(seed * 977u + 3u),
+          ridge(seed * 1931u + 29u), detail(seed * 7919u + 13u) {}
+    Climate At(int x, int z) const {
+        Climate c;
+        c.continent   = cont.Fbm(x / 170.0, z / 170.0, 4);
+        c.temperature = temp.Fbm(x / 140.0 + 31.7, z / 140.0, 3);
+        c.humidity    = humid.Fbm(x / 120.0, z / 120.0 + 57.3, 3);
+        c.mountain    = mount.Fbm(x / 110.0, z / 110.0, 3);
+        c.ridge       = 1.0 - std::fabs(ridge.Fbm(x / 55.0, z / 55.0, 4)) * 2.2;   // sharp crests
+        c.detail      = detail.Fbm(x / 40.0, z / 40.0, 3);
+        return c;
+    }
+};
+
+// Terrain height (first air block) and biome from the climate
+inline void ShapeColumn(const Climate& c, int& outH, uint8_t& outBiome) {
+    const double land = SmoothStep(-0.16, -0.02, c.continent);      // 0 in the ocean, 1 inland
+    double h = 64.0 + c.continent * 24.0 + c.detail * 3.0;          // gentle plains, ocean basins
+    h -= SmoothStep(-0.12, -0.38, c.continent) * 12.0;               // open ocean gets properly deep
+
+    double mtn = SmoothStep(0.10, 0.28, c.mountain) * land;         // mountains rise inland
+    h += mtn * (14.0 + std::max(0.0, c.ridge) * 34.0);
+
+    double swamp = SmoothStep(0.12, 0.26, c.humidity) * SmoothStep(-0.02, 0.10, c.temperature) * (1.0 - mtn) * land;
+    h += (61.5 + c.detail * 2.5 - h) * swamp;                       // swamps sit at the waterline
+
+    double desert = SmoothStep(0.06, 0.16, c.temperature) * SmoothStep(0.02, -0.08, c.humidity) * (1.0 - mtn) * land;
+    h += desert * std::fabs(c.detail) * 4.0;                        // low dunes
+
+    int hi = (int)std::floor(h);
+    outH = std::max(8, std::min(WY - 12, hi));
+
+    const bool cold = c.temperature < -0.24;
+    if (outH < SEA_LEVEL && c.continent < -0.04) outBiome = cold ? FROZEN_OCEAN : OCEAN;
+    else if (mtn > 0.5)                             outBiome = MOUNTAINS;
+    else if (outH <= SEA_LEVEL + 1 && land < 0.98 && !cold && desert < 0.5) outBiome = BEACH;
+    else if (cold)                                  outBiome = SNOWY_PLAINS;
+    else if (c.temperature < -0.13)                 outBiome = TAIGA;
+    else if (desert > 0.5)                          outBiome = DESERT;
+    else if (swamp > 0.5)                           outBiome = SWAMP;
+    else if (c.humidity > 0.06)                     outBiome = c.temperature < 0.04 ? BIRCH_FOREST : FOREST;
+    else                                            outBiome = PLAINS;
+}
+
+// Averages biome colors over a 9x9 area so grass and water fade between biomes
+inline void BlendBiomeColors(World& w) {
+    const int R = 4;
+    for (int x = 0; x < WX; ++x)
+        for (int z = 0; z < WZ; ++z) {
+            int sum[3][3] = {};
+            int n = 0;
+            for (int dx = -R; dx <= R; ++dx)
+                for (int dz = -R; dz <= R; ++dz) {
+                    const BiomeInfo& b = BiomeData(w.BiomeAt(std::clamp(x + dx, 0, WX - 1), std::clamp(z + dz, 0, WZ - 1)));
+                    uint32_t cols[3] = {b.grass, b.foliage, b.water};
+                    for (int k = 0; k < 3; ++k)
+                        for (int ch = 0; ch < 3; ++ch) sum[k][ch] += (cols[k] >> (16 - 8 * ch)) & 0xFF;
+                    ++n;
+                }
+            auto pack = [&](int k) { return (uint32_t)((sum[k][0] / n) << 16 | (sum[k][1] / n) << 8 | (sum[k][2] / n)); };
+            size_t i = World::Col(x, z);
+            w.grassColor[i] = pack(0); w.foliageColor[i] = pack(1); w.waterColor[i] = pack(2);
+        }
+}
+
 inline void Generate(World& w, uint32_t seed) {
     w.seed = seed;
-    Perlin broad(seed), detail(seed * 7919u + 13u);
+    ClimateNoise noise(seed);
     std::vector<int> heights((size_t)WX * WZ);
+
+    std::vector<double> details((size_t)WX * WZ);
+    for (int x = 0; x < WX; ++x)
+        for (int z = 0; z < WZ; ++z) {
+            Climate c = noise.At(x, z);
+            int h;
+            uint8_t biome;
+            ShapeColumn(c, h, biome);
+            heights[World::Col(x, z)] = h;
+            w.biome[World::Col(x, z)] = biome;
+            details[World::Col(x, z)] = c.detail;
+        }
+    auto heightAt = [&](int x, int z) { return heights[World::Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; };
 
     for (int x = 0; x < WX; ++x)
     for (int z = 0; z < WZ; ++z) {
-        double b = broad.Fbm(x / 160.0, z / 160.0, 4);
-        double d = detail.Fbm(x / 40.0, z / 40.0, 3);
-        int h = (int)std::floor(64.0 + b * 16.0 + d * 3.0);   // first air y
-        h = std::max(8, std::min(WY - 24, h));
-        heights[(size_t)x * WZ + z] = h;
+        const int h = heights[World::Col(x, z)];
+        const uint8_t biome = w.biome[World::Col(x, z)];
+        Climate c;
+        c.detail = details[World::Col(x, z)];
+        // Steepness: how far the ground drops to the lowest neighbour
+        const int slope = h - std::min(std::min(heightAt(x + 1, z), heightAt(x - 1, z)), std::min(heightAt(x, z + 1), heightAt(x, z - 1)));
 
-        bool sandy = h <= SEA_LEVEL + 1;   // beaches and pond floors
+        // Surface layers: what the top few blocks are made of
+        uint8_t top = GRASS, under = DIRT;
+        int depth = 4;
+        const bool wet = h <= SEA_LEVEL + 1;   // shores and the bottoms of ponds and seas
+        switch (biome) {
+            case DESERT: case BEACH: top = under = SAND; depth = 5; break;
+            case OCEAN: case FROZEN_OCEAN: top = under = SAND; break;
+            case SWAMP: if (h < SEA_LEVEL) top = DIRT; break;      // muddy pools, no sand
+            case MOUNTAINS:
+                if (h > 84 + (int)(c.detail * 6)) { top = under = STONE; depth = 1; }   // bare rock up high
+                break;
+            default: if (wet) top = under = SAND; break;
+        }
+        // Cliffs too steep for soil show bare stone (no walls of dirt)
+        if (slope >= 3 && top != SAND) { top = under = STONE; depth = 1; }
+        if (top == GRASS && h < SEA_LEVEL) top = DIRT;               // grass doesn't grow underwater
+
         for (int y = 0; y < h; ++y) {
             uint8_t block;
             if (y == 0) block = BEDROCK;
             else if (y <= 4 && Hash01(x, y, z, seed) < (5 - y) / 5.0) block = BEDROCK;
-            else if (y < h - 4) block = STONE;
-            else if (y < h - 1) block = sandy ? SAND : DIRT;
-            else                block = sandy ? SAND : GRASS;
+            else if (y < h - depth) block = STONE;
+            else if (y < h - 1)     block = under;
+            else                    block = top;
             w.SetRaw(x, y, z, block);
         }
+        // Snow-capped peaks
+        if (biome == MOUNTAINS && h > 102 + (int)(c.detail * 6))
+            for (int y = h - 2; y < h; ++y) w.SetRaw(x, y, z, SNOW_BLOCK);
         for (int y = h; y < SEA_LEVEL; ++y) w.SetRaw(x, y, z, WATER);
+        if (BiomeData(biome).snowy && h < SEA_LEVEL) w.SetRaw(x, SEA_LEVEL - 1, z, ICE);   // frozen over
     }
+    BlendBiomeColors(w);
 
     CarveCaves(w, seed);   // caves first, so ores show in the cave walls
     PlaceOres(w, seed);
 
-    // Trees: plains are sparse
+    // Trees and cactus: each biome has its own mix and density
     for (int x = 3; x < WX - 3; ++x)
     for (int z = 3; z < WZ - 3; ++z) {
-        int h = heights[(size_t)x * WZ + z];
-        if (w.Get(x, h - 1, z) != GRASS) continue;
-        if (Hash01(x, 0, z, seed + 11) < 0.0025) PlaceOakTree(w, x, h, z, seed);
+        int h = heights[World::Col(x, z)];
+        uint8_t ground = w.Get(x, h - 1, z);
+        double roll = Hash01(x, 0, z, seed + 11), pick = Hash01(x, 7, z, seed + 19);
+        switch (w.biome[World::Col(x, z)]) {
+            case DESERT:
+                if (ground == SAND && roll < 0.006) PlaceCactus(w, x, h, z, seed);
+                break;
+            case PLAINS:       if (ground == GRASS && roll < 0.0025) PlaceOakTree(w, x, h, z, seed); break;
+            case FOREST:       if (ground == GRASS && roll < 0.035) PlaceOakTree(w, x, h, z, seed, pick < 0.2); break;
+            case BIRCH_FOREST: if (ground == GRASS && roll < 0.03) PlaceOakTree(w, x, h, z, seed, true); break;
+            case TAIGA:        if (ground == GRASS && roll < 0.03) PlaceSpruceTree(w, x, h, z, seed); break;
+            case SNOWY_PLAINS: if (ground == GRASS && roll < 0.003) PlaceSpruceTree(w, x, h, z, seed); break;
+            case SWAMP:        if (ground == GRASS && roll < 0.012) PlaceOakTree(w, x, h, z, seed); break;
+            case MOUNTAINS:
+                if (ground == GRASS && roll < 0.006) {
+                    if (pick < 0.6) PlaceSpruceTree(w, x, h, z, seed); else PlaceOakTree(w, x, h, z, seed);
+                }
+                break;
+            default: break;
+        }
     }
+
+    // A thin layer of snow on everything in snowy places (and up the mountains)
+    for (int x = 0; x < WX; ++x)
+        for (int z = 0; z < WZ; ++z) {
+            int y = WY - 1;
+            while (y > 0 && w.Get(x, y, z) == AIR) --y;
+            uint8_t b = w.Get(x, y, z);
+            bool snowy = BiomeData(w.biome[World::Col(x, z)]).snowy ||
+                         (w.biome[World::Col(x, z)] == MOUNTAINS && y >= 98);
+            if (snowy && y + 1 < WY && (Info(b).opaque || IsLeaves(b)) && b != ICE) w.SetRaw(x, y + 1, z, SNOW);
+        }
 
     for (int x = 0; x < WX; ++x)
         for (int z = 0; z < WZ; ++z) w.RecomputeTop(x, z);
@@ -898,6 +1168,12 @@ inline bool Overlaps(const AABB& a, const AABB& b) {
            a.maxZ > b.minZ + EPS && a.minZ < b.maxZ - EPS;
 }
 
+// The part of a block you bump into (cactus is inset 1/16 like Minecraft's)
+inline AABB CollisionBox(uint8_t b, int x, int y, int z) {
+    if (b == CACTUS) return {x + 1 / 16.0, (double)y, z + 1 / 16.0, x + 15 / 16.0, y + 15 / 16.0, z + 15 / 16.0};
+    return {(double)x, (double)y, (double)z, x + 1.0, y + 1.0, z + 1.0};
+}
+
 inline void CollectSolid(const World& w, const AABB& r, std::vector<AABB>& out) {
     out.clear();
     int x0 = (int)std::floor(r.minX), x1 = (int)std::floor(r.maxX);
@@ -907,7 +1183,7 @@ inline void CollectSolid(const World& w, const AABB& r, std::vector<AABB>& out) 
         for (int y = y0; y <= y1; ++y)
             for (int z = z0; z <= z1; ++z)
                 if (w.SolidAt(x, y, z))
-                    out.push_back({(double)x, (double)y, (double)z, x + 1.0, y + 1.0, z + 1.0});
+                    out.push_back(CollisionBox(w.Get(x, y, z), x, y, z));
 }
 
 inline bool AnySolid(const World& w, const AABB& box) {
@@ -1006,7 +1282,7 @@ inline void Spawn(const World& w, Player& p) {
             for (int dz = -r; dz <= r; ++dz) {
                 if (std::max(std::abs(dx), std::abs(dz)) != r) continue;
                 int x = cx + dx, z = cz + dz, y = WY - 1;
-                while (y > 0 && w.Get(x, y, z) == AIR) --y;
+                while (y > 0 && (w.Get(x, y, z) == AIR || w.Get(x, y, z) == SNOW)) --y;
                 uint8_t b = w.Get(x, y, z);
                 if (b != GRASS && b != SAND) continue;   // not water, trees, or the bottom of a cave mouth
                 bool clear = true;   // no tree canopy within 2 blocks: spawn in the open
@@ -1113,7 +1389,8 @@ inline void TickPlayer(const World& w, Player& p, const PlayerInput& in) {
         p.vx *= WATER_DRAG; p.vy *= WATER_DRAG; p.vz *= WATER_DRAG;
         p.vy -= WATER_GRAVITY;
     } else {
-        double slip = p.onGround ? BLOCK_SLIPPERINESS : 1.0;
+        uint8_t under = w.Get((int)std::floor(p.x), (int)std::floor(p.y - 0.5000001), (int)std::floor(p.z));
+        double slip = p.onGround ? Slipperiness(under) : 1.0;
         double friction = p.onGround ? slip * AIR_FRICTION : AIR_FRICTION;
         double speed = MOVE_SPEED * (p.sprinting ? SPRINT_MULT : 1.0);
         double accel;
@@ -1181,6 +1458,7 @@ inline void TickSurvival(const World& w, Player& p) {
     }
 
     if (p.y < -64.0) Hurt(p, 4);   // the void
+    if (TouchesBlock(w, p.Box(), CACTUS)) Hurt(p, 1);
 
     // Every 4 exhaustion eats a point of saturation, then a point of food
     if (p.exhaustion > 4.0) {
@@ -1244,6 +1522,8 @@ inline AABB BlockBox(uint8_t b, int x, int y, int z) {
         case WALL_TORCH_NX: return {x + 11 * p, y + 3 * p, z + 5.5 * p, x + 1.0, y + 13 * p, z + 10.5 * p};
         case WALL_TORCH_PZ: return {x + 5.5 * p, y + 3 * p, (double)z, x + 10.5 * p, y + 13 * p, z + 5 * p};
         case WALL_TORCH_NZ: return {x + 5.5 * p, y + 3 * p, z + 11 * p, x + 10.5 * p, y + 13 * p, z + 1.0};
+        case SNOW:          return {(double)x, (double)y, (double)z, x + 1.0, y + 2 * p, z + 1.0};
+        case CACTUS:        return {x + p, (double)y, z + p, x + 15 * p, y + 1.0, z + 15 * p};
         default:            return {(double)x, (double)y, (double)z, x + 1.0, y + 1.0, z + 1.0};
     }
 }
@@ -1290,8 +1570,8 @@ inline RayHit Raycast(const World& w, double ox, double oy, double oz,
     double t = 0;
     while (t <= maxDist) {
         uint8_t b = w.Get(x, y, z);
-        if (IsTorch(b)) {
-            // Small hitbox: the ray can pass beside a torch
+        if (IsTorch(b) || b == SNOW || b == CACTUS) {
+            // Small hitbox: the ray can pass beside a torch or over thin snow
             double tt; int hx, hy, hz;
             if (RayBox(ox, oy, oz, dx, dy, dz, BlockBox(b, x, y, z), tt, hx, hy, hz) && tt <= maxDist) {
                 r.hit = true; r.x = x; r.y = y; r.z = z;
@@ -1346,7 +1626,8 @@ inline bool WearTool(Stack& s, int amount) {
 inline Stack BlockDrop(uint8_t b, uint8_t tool = AIR) {
     if (!CanHarvest(b, tool)) return {};
     switch (b) {
-        case AIR: case WATER: case BEDROCK: case GLASS: return {};
+        case AIR: case WATER: case BEDROCK: case GLASS: case ICE: case SNOW: return {};   // snow needs snowballs, ice melts
+        case SPRUCE_LEAVES: case BIRCH_LEAVES: return {};
         case GRASS:    return {DIRT, 1};
         case STONE:    return {COBBLESTONE, 1};
         case COAL_ORE:    return {COAL, 1};
@@ -1473,7 +1754,8 @@ inline void TickItems(const World& w, std::vector<ItemEntity>& items, const Play
         if (dy != e.vy) e.vy = 0;
         if (dz != e.vz) e.vz = 0;
 
-        double f = e.onGround ? BLOCK_SLIPPERINESS * 0.98 : 0.98;
+        uint8_t under = w.Get((int)std::floor(e.x), (int)std::floor(e.y - 0.5000001), (int)std::floor(e.z));
+        double f = e.onGround ? Slipperiness(under) * 0.98 : 0.98;
         e.vx *= f; e.vy *= 0.98; e.vz *= f;
 
         if (canPickUp && e.pickupDelay == 0 && Overlaps(reach, e.Box()))

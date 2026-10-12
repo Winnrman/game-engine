@@ -1,2 +1,5 @@
 build/
 external/
+# Local texture packs (see assets/pack/README.md)
+assets/pack/*
+!assets/pack/README.md

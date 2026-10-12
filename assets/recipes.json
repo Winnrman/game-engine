@@ -6,11 +6,17 @@
     "shapeless: 'ingredients' lists the items, in any arrangement.",
     "smelting: a furnace recipe with one 'ingredient'; 'cookingtime' in ticks (default 200 = 10 s).",
     "result: an item id, or {'item': id, 'count': n}.",
+    "Anywhere an item goes you can write '#tag' to accept any item in that tag (see 'tags' below).",
     "Item ids: grass_block dirt stone cobblestone oak_log oak_leaves oak_planks sand glass bricks coal_ore iron_ore",
     "  crate crafting_table torch apple stick coal wooden_pickaxe wooden_axe wooden_shovel wooden_sword",
     "  stone_pickaxe stone_axe stone_shovel stone_sword diamond_ore emerald_ore diamond emerald",
-    "  furnace iron_ingot iron_pickaxe iron_axe iron_shovel iron_sword"
+    "  furnace iron_ingot iron_pickaxe iron_axe iron_shovel iron_sword",
+    "  spruce_log spruce_leaves spruce_planks birch_log birch_leaves birch_planks cactus snow snow_block ice"
   ],
+  "tags": {
+    "planks": ["oak_planks", "spruce_planks", "birch_planks"],
+    "logs":   ["oak_log", "spruce_log", "birch_log"]
+  },
   "recipes": [
     {
       "type": "shapeless",
@@ -18,17 +24,27 @@
       "result": {"item": "oak_planks", "count": 4}
     },
     {
+      "type": "shapeless",
+      "ingredients": ["spruce_log"],
+      "result": {"item": "spruce_planks", "count": 4}
+    },
+    {
+      "type": "shapeless",
+      "ingredients": ["birch_log"],
+      "result": {"item": "birch_planks", "count": 4}
+    },
+    {
       "type": "shaped",
       "pattern": ["#",
                   "#"],
-      "key": {"#": "oak_planks"},
+      "key": {"#": "#planks"},
       "result": {"item": "stick", "count": 4}
     },
     {
       "type": "shaped",
       "pattern": ["##",
                   "##"],
-      "key": {"#": "oak_planks"},
+      "key": {"#": "#planks"},
       "result": "crafting_table"
     },
     {
@@ -44,7 +60,7 @@
       "pattern": ["XXX",
                   " # ",
                   " # "],
-      "key": {"X": "oak_planks", "#": "stick"},
+      "key": {"X": "#planks", "#": "stick"},
       "result": "wooden_pickaxe"
     },
     {
@@ -52,7 +68,7 @@
       "pattern": ["XX",
                   "X#",
                   " #"],
-      "key": {"X": "oak_planks", "#": "stick"},
+      "key": {"X": "#planks", "#": "stick"},
       "result": "wooden_axe"
     },
     {
@@ -60,7 +76,7 @@
       "pattern": ["X",
                   "#",
                   "#"],
-      "key": {"X": "oak_planks", "#": "stick"},
+      "key": {"X": "#planks", "#": "stick"},
       "result": "wooden_shovel"
     },
     {
@@ -68,7 +84,7 @@
       "pattern": ["X",
                   "X",
                   "#"],
-      "key": {"X": "oak_planks", "#": "stick"},
+      "key": {"X": "#planks", "#": "stick"},
       "result": "wooden_sword"
     },
 

@@ -253,7 +253,7 @@ int main() {
         std::string log;
         bool loaded = book.Load(std::string(MYENGINE_ASSETS) + "/recipes.json", log);
         std::printf("%s", log.c_str());
-        bool ok = loaded && log.empty() && book.recipes.size() == 23;
+        bool ok = loaded && log.empty() && book.recipes.size() == 25;
         std::printf("%-28s %9d recipes  %s\n", "recipes.json loads", (int)book.recipes.size(), ok ? "OK" : "FAIL");
         if (!ok) ++fails;
 
@@ -511,6 +511,107 @@ int main() {
         lw.Set(102, 40, 102, FURNACE_PX);
         RelightAround(lw, 102, 40, 102);
         check("unlit furnace: no light", lw.BlockLight(103, 40, 102), 0, 0);
+    }
+
+    // ---- Recipe tags: any planks will do ----
+    {
+        RecipeBook book;
+        std::string log;
+        book.Load(std::string(MYENGINE_ASSETS) + "/recipes.json", log);
+        auto make = [&](int n, std::initializer_list<uint8_t> cells) {
+            Stack grid[9];
+            int i = 0;
+            for (uint8_t c : cells) { if (c) grid[i] = {c, 1}; ++i; }
+            const Recipe* r = book.Match(grid, n);
+            return r ? r->result : Stack{};
+        };
+        bool ok = make(2, {SPRUCE_LOG, 0, 0, 0}).item == SPRUCE_PLANKS && make(2, {0, BIRCH_LOG, 0, 0}).item == BIRCH_PLANKS &&
+                  make(2, {SPRUCE_PLANKS, 0, SPRUCE_PLANKS, 0}).item == STICK &&
+                  make(2, {PLANKS, SPRUCE_PLANKS, BIRCH_PLANKS, PLANKS}).item == CRAFTING_TABLE &&
+                  make(3, {BIRCH_PLANKS, SPRUCE_PLANKS, BIRCH_PLANKS, 0, STICK, 0, 0, STICK, 0}).item == WOODEN_PICKAXE &&
+                  make(2, {SPRUCE_LOG, 0, STICK, 0}).count == 0;
+        std::printf("%-28s %9s  %s\n", "#planks tag recipes", ok ? "work" : "broken", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+    }
+
+    // ---- Biomes ----
+    {
+        int seen[BIOME_COUNT] = {};
+        long cactusBad = 0, snowBad = 0, snowInDesert = 0, cactus = 0, ice = 0, spruce = 0, birch = 0;
+        for (uint32_t seed : {1337u, 4242u, 99u}) {
+            World g;
+            Generate(g, seed);
+            for (int x = 0; x < WX; ++x)
+                for (int z = 0; z < WZ; ++z) {
+                    uint8_t biome = g.BiomeAt(x, z);
+                    ++seen[biome];
+                    for (int y = 1; y < WY; ++y) {
+                        uint8_t b = g.Get(x, y, z);
+                        if (b == CACTUS) { ++cactus; if (!CanSurvive(g, b, x, y, z)) ++cactusBad; }
+                        if (b == SNOW) { if (!CanSurvive(g, b, x, y, z)) ++snowBad; if (biome == DESERT) ++snowInDesert; }
+                        if (b == ICE) ++ice;
+                        if (b == SPRUCE_LOG) ++spruce;
+                        if (b == BIRCH_LOG) ++birch;
+                    }
+                }
+        }
+        int kinds = 0;
+        for (int b = 0; b < BIOME_COUNT; ++b) kinds += seen[b] > 0;
+        std::printf("%-28s %9d of %d\n", "biomes in 3 worlds", kinds, BIOME_COUNT);
+        bool ok = kinds == BIOME_COUNT && cactus > 0 && ice > 0 && spruce > 0 && birch > 0;
+        std::printf("%-28s %9s  %s\n", "biome features generated", ok ? "all" : "missing", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+        check("cactus not on sand", (double)cactusBad, 0, 0);
+        check("snow floating or on ice", (double)snowBad, 0, 0);
+        check("snow in the desert", (double)snowInDesert, 0, 0);
+
+        // Grass color blends: a column deep in a biome has its exact color
+        World g; Generate(g, 1337);
+        bool exact = false;
+        for (int x = 8; x < WX - 8 && !exact; ++x)
+            for (int z = 8; z < WZ - 8 && !exact; ++z) {
+                bool same = true;
+                for (int d = -4; d <= 4 && same; ++d) same = g.BiomeAt(x + d, z) == g.BiomeAt(x, z) && g.BiomeAt(x, z + d) == g.BiomeAt(x, z);
+                exact = same && g.GrassAt(x, z) == BiomeData(g.BiomeAt(x, z)).grass;
+            }
+        std::printf("%-28s %9s  %s\n", "biome grass color", exact ? "exact" : "wrong", exact ? "OK" : "FAIL");
+        if (!exact) ++fails;
+    }
+
+    // ---- Ice, cactus ----
+    {
+        // Ice is slippery: you glide much further after letting go
+        auto glide = [&](uint8_t floor) {
+            World fw;
+            for (int x = 0; x < WX; ++x)
+                for (int z = 0; z < WZ; ++z) { for (int y = 0; y < 64; ++y) fw.SetRaw(x, y, z, y == 63 ? floor : STONE); }
+            Player p = Fresh(fw);
+            for (int i = 0; i < 60; ++i) TickPlayer(fw, p, walk);
+            double x0 = p.x;
+            for (int i = 0; i < 200; ++i) TickPlayer(fw, p, none);
+            return p.x - x0;
+        };
+        double onStone = glide(STONE), onIce = glide(ICE);
+        std::printf("%-28s stone %.2f m, ice %.2f m\n", "stopping distance", onStone, onIce);
+        bool ok = onStone < 0.6 && onIce > 1.5;
+        std::printf("%-28s %9s  %s\n", "ice is slippery", ok ? "yes" : "no", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        // Walking into a cactus: it stops you short and hurts
+        World cw;
+        for (int x = 0; x < WX; ++x)
+            for (int z = 0; z < WZ; ++z) { for (int y = 0; y < 64; ++y) cw.SetRaw(x, y, z, y == 63 ? SAND : STONE); }
+        cw.SetRaw(24, 64, 128, CACTUS);
+        Player p = Fresh(cw);
+        for (int i = 0; i < 60; ++i) { TickPlayer(cw, p, walk); TickSurvival(cw, p); }
+        ok = p.x < 24.0 && p.x > 23.6 && p.health < MAX_HEALTH;
+        std::printf("%-28s x=%.3f hp=%.0f  %s\n", "cactus blocks and hurts", p.x, p.health, ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+        ok = CanSurvive(cw, CACTUS, 24, 64, 128) && !CanSurvive(cw, CACTUS, 30, 70, 128) && BreakTicks(CACTUS) / 20.0 == 0.6;
+        std::printf("%-28s %9s  %s\n", "cactus rules", ok ? "as wiki" : "wrong", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+        check("Hand: Snow s", BreakTicks(SNOW) / 20.0, 0.5, 1e-9);
+        check("Hand: Ice s", BreakTicks(ICE) / 20.0, 0.75, 1e-9);
     }
 
     // Real terrain generation sanity

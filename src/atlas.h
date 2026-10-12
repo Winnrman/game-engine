@@ -42,6 +42,9 @@ inline double Rnd(int tile, int x, int y, int salt = 0) {
 }
 inline Col Mul(Col c, double k) { return {c.r * k, c.g * k, c.b * k}; }
 
+// Grass, leaves and water are painted in gray and tinted by the biome when
+// drawn, the way Minecraft colors them (so a swamp and a jungle can share art)
+
 // Shared looks, reused by several tiles
 inline Col DirtAt(int x, int y) {
     double n = Rnd(2, x, y), s = Rnd(2, x, y, 1);
@@ -50,11 +53,11 @@ inline Col DirtAt(int x, int y) {
     else if (s > 0.94) c = {158, 116, 84};
     return c;
 }
-inline Col GrassAt(int x, int y) {
+inline Col GrassAt(int x, int y) {   // gray: multiplied by the biome's grass color
     double n = Rnd(0, x, y), s = Rnd(0, x, y, 1);
-    Col c = Mul({108, 170, 62}, 0.84 + 0.28 * n);
-    if (s > 0.88) c = Mul(c, 1.15);
-    return c;
+    double v = 205 * (0.84 + 0.28 * n);
+    if (s > 0.88) v *= 1.15;
+    return {v, v, v};
 }
 inline Col StoneAt(int x, int y, int salt = 0) {
     double n = Rnd(3, x, y, salt), m = Rnd(3, x / 3, y / 2, salt + 5);
@@ -184,6 +187,67 @@ inline void PaintCraftingTable(Image& im) {
         }
 }
 
+// Spruce and birch wood, cactus, snow and ice
+inline void PaintBiomeBlocks(Image& im) {
+    using namespace game;
+    for (int y = 0; y < TILE; ++y)
+        for (int x = 0; x < TILE; ++x) {
+            // Spruce: dark, deeply grooved bark; dark rings; dark planks
+            {
+                Col bark = Mul({74, 52, 30}, 0.75 + 0.35 * Rnd(56, x, 0));
+                bark = Mul(bark, 0.88 + 0.2 * Rnd(56, x, y));
+                if (x % 4 == 0) bark = Mul(bark, 0.72);
+                Put(im, T_SPRUCE_LOG, x, y, bark);
+                double d = std::max(std::fabs(x - 7.5), std::fabs(y - 7.5));
+                Col top = d > 6.5 ? Mul({74, 52, 30}, 0.9) : (((int)d % 2 == 0) ? Col{120, 88, 52} : Col{96, 70, 40});
+                Put(im, T_SPRUCE_LOG_TOP, x, y, Mul(top, 0.94 + 0.1 * Rnd(57, x, y)));
+                int board = y / 4;
+                Col pl = Mul({114, 84, 48}, 0.9 + 0.12 * Rnd(59, x / 3, y, board));
+                if (y % 4 == 3) pl = {76, 54, 30};
+                if (x == (board * 7 + 2) % 16) pl = Mul(pl, 0.72);
+                Put(im, T_SPRUCE_PLANKS, x, y, pl);
+            }
+            // Birch: white bark with black dashes; pale rings; pale planks
+            {
+                Col bark = Mul({216, 214, 206}, 0.92 + 0.1 * Rnd(60, x, y));
+                double dash = Rnd(60, x / 3, y, 3);
+                if (dash > 0.86 && Rnd(60, x, y / 2, 4) > 0.3) bark = {46, 44, 40};
+                else if (dash > 0.8) bark = Mul(bark, 0.8);
+                Put(im, T_BIRCH_LOG, x, y, bark);
+                double d = std::max(std::fabs(x - 7.5), std::fabs(y - 7.5));
+                Col top = d > 6.5 ? Col{214, 212, 204} : (((int)d % 2 == 0) ? Col{200, 182, 128} : Col{176, 158, 104});
+                Put(im, T_BIRCH_LOG_TOP, x, y, Mul(top, 0.94 + 0.1 * Rnd(61, x, y)));
+                int board = y / 4;
+                Col pl = Mul({196, 178, 122}, 0.92 + 0.1 * Rnd(63, x / 3, y, board));
+                if (y % 4 == 3) pl = {150, 132, 86};
+                if (x == (board * 3 + 5) % 16) pl = Mul(pl, 0.8);
+                Put(im, T_BIRCH_PLANKS, x, y, pl);
+            }
+            // Cactus: ribbed green sides with pale spines; the side columns at
+            // the very edge are see-through because the model is inset 1px
+            {
+                Col g = Mul({70, 128, 42}, 0.85 + 0.2 * Rnd(64, x, y));
+                if (x % 4 == 1) g = Mul(g, 0.75);                                // ribs
+                bool spine = (x % 4 == 3) && (y % 3 == (x / 4) % 3);
+                if (spine) g = {214, 220, 180};
+                Put(im, T_CACTUS_SIDE, x, y, g, (x == 0 || x == 15) ? 0 : 255);
+                double d = std::max(std::fabs(x - 7.5), std::fabs(y - 7.5));
+                Col top = d > 6.5 ? Col{0, 0, 0} : (d > 5.5 ? Mul({70, 128, 42}, 0.8) : Mul({96, 150, 60}, 0.9 + 0.15 * Rnd(65, x, y)));
+                if (d < 1.5) top = {120, 170, 80};
+                Put(im, T_CACTUS_TOP, x, y, top, d > 6.5 ? 0 : 255);
+                Put(im, T_CACTUS_BOTTOM, x, y, Mul({70, 128, 42}, 0.7 + 0.15 * Rnd(66, x, y)), d > 6.5 ? 0 : 255);
+            }
+            // Snow: almost white with a cold blue speckle
+            Put(im, T_SNOW, x, y, Mul({242, 250, 252}, 0.93 + 0.07 * Rnd(67, x, y)));
+            // Ice: translucent pale blue with long streaks
+            {
+                Col c = Mul({150, 186, 245}, 0.9 + 0.12 * Rnd(68, x, y));
+                if (Rnd(68, (x + y) / 3, 0, 1) > 0.75) c = Mul(c, 1.12);
+                Put(im, T_ICE, x, y, c, 165);
+            }
+        }
+}
+
 inline Image Build() {
     using namespace game;
     Image im;
@@ -196,10 +260,16 @@ inline Image Build() {
         // Dirt
         Put(im, T_DIRT, x, y, DirtAt(x, y));
 
-        // Grass side: dirt with a ragged green fringe on top
+        // Grass side: plain dirt, with a ragged grassy fringe as a separate
+        // overlay tile (tinted, drawn on top) like Minecraft's
         {
             bool green = y < 3 || (y == 3 && Rnd(1, x, 0) < 0.6) || (y == 4 && Rnd(1, x, 1) < 0.25);
-            Put(im, T_GRASS_SIDE, x, y, green ? GrassAt(x, y) : DirtAt(x, y));
+            Put(im, T_GRASS_SIDE, x, y, DirtAt(x, y));
+            Put(im, T_GRASS_OVERLAY, x, y, GrassAt(x, y), green ? 255 : 0);
+            // Under snow the fringe is white
+            Col snow = Mul({240, 248, 250}, 0.94 + 0.08 * Rnd(55, x, y));
+            bool white = y < 2 || (y == 2 && Rnd(55, x, 0) < 0.7) || (y == 3 && Rnd(55, x, 1) < 0.3);
+            Put(im, T_GRASS_SNOW_SIDE, x, y, white ? snow : DirtAt(x, y));
         }
 
         // Stone
@@ -224,10 +294,14 @@ inline Image Build() {
             Put(im, T_LOG_TOP, x, y, c);
         }
 
-        // Leaves: green with see-through gaps (alpha cutout)
+        // Leaves: gray (tinted per biome / tree) with see-through gaps
         {
-            Col c = Mul({58, 112, 36}, 0.72 + 0.48 * Rnd(7, x, y));
-            Put(im, T_LEAVES, x, y, c, Rnd(7, x, y, 1) < 0.22 ? 0 : 255);
+            double v = 165 * (0.72 + 0.48 * Rnd(7, x, y));
+            Put(im, T_LEAVES, x, y, {v, v, v}, Rnd(7, x, y, 1) < 0.22 ? 0 : 255);
+            double sv = 150 * (0.7 + 0.45 * Rnd(58, x, y));                    // spruce: denser needles
+            Put(im, T_SPRUCE_LEAVES, x, y, {sv, sv, sv}, Rnd(58, x, y, 1) < 0.14 ? 0 : 255);
+            double bv = 175 * (0.75 + 0.4 * Rnd(62, x, y));                    // birch: lighter, airier
+            Put(im, T_BIRCH_LEAVES, x, y, {bv, bv, bv}, Rnd(62, x, y, 1) < 0.26 ? 0 : 255);
         }
 
         // Planks: 4 boards with staggered seams
@@ -273,11 +347,11 @@ inline Image Build() {
             Put(im, T_BEDROCK, x, y, {v, v, v});
         }
 
-        // Water: translucent blue
+        // Water: translucent, gray here and tinted by the biome's water color
         {
-            Col c = Mul({46, 92, 210}, 0.85 + 0.2 * Rnd(15, x, y));
-            if (Rnd(15, x / 3, y, 1) > 0.9) c = Mul(c, 1.25);
-            Put(im, T_WATER, x, y, c, 175);
+            double v = 225 * (0.85 + 0.2 * Rnd(15, x, y));
+            if (Rnd(15, x / 3, y, 1) > 0.9) v *= 1.12;
+            Put(im, T_WATER, x, y, {v, v, v}, 175);
         }
 
         // Crate: a nod to the first textured cube in this engine
@@ -410,6 +484,7 @@ inline Image Build() {
     }
 
     PaintCraftingTable(im);
+    PaintBiomeBlocks(im);
 
     // Torch: a 2px stick (columns 7-8, rows 8-15) with a 2px flame on top
     // (rows 6-7). The 3D torch model samples exactly this 2x10 strip.

@@ -7,6 +7,7 @@
 //              character to an item. The pattern can sit anywhere in the
 //              grid and may be mirrored left-to-right.
 //   shapeless  a list of ingredients in any arrangement.
+//   Anywhere an item goes, "#tag" means any item listed under that tag.
 //   smelting   one ingredient cooked in a furnace (200 ticks unless
 //              "cookingtime" says otherwise).
 // ============================================================================
@@ -15,18 +16,29 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <map>
+#include <functional>
+#include <algorithm>
 
 namespace game {
+
+// What may go in one slot: a single item, or any item of a tag like "#planks"
+using Ingredient = std::vector<uint8_t>;
+using TagMap = std::map<std::string, Ingredient>;
+
+inline bool Accepts(const Ingredient& in, uint8_t item) {
+    return std::find(in.begin(), in.end(), item) != in.end();
+}
 
 struct Recipe {
     std::string name;
     bool smelting = false;              // furnace recipe: `input` -> result
-    uint8_t input = AIR;
+    Ingredient input;
     int  cookTime = 200;
     bool shaped = true;
     int  w = 0, h = 0;
-    uint8_t cells[9] = {};              // shaped: row-major w*h, AIR = empty
-    std::vector<uint8_t> ingredients;   // shapeless, sorted
+    Ingredient cells[9];                // shaped: row-major w*h, empty = nothing there
+    std::vector<Ingredient> ingredients;   // shapeless
     Stack result;
 };
 
@@ -36,7 +48,22 @@ inline bool ParseItemRef(const json::Value* v, uint8_t& out, std::string& why) {
     return true;
 }
 
-inline bool ParseRecipe(const json::Value& v, Recipe& r, std::string& why) {
+// "oak_planks" or "#planks" (any item listed under that tag)
+inline bool ParseIngredient(const json::Value* v, const TagMap& tags, Ingredient& out, std::string& why) {
+    out.clear();
+    if (v && v->IsString() && !v->string.empty() && v->string[0] == '#') {
+        auto it = tags.find(v->string.substr(1));
+        if (it == tags.end()) { why = "unknown tag \"" + v->string + "\""; return false; }
+        out = it->second;
+        return true;
+    }
+    uint8_t id;
+    if (!ParseItemRef(v, id, why)) return false;
+    out.push_back(id);
+    return true;
+}
+
+inline bool ParseRecipe(const json::Value& v, const TagMap& tags, Recipe& r, std::string& why) {
     if (!v.IsObject()) { why = "recipe must be an object"; return false; }
 
     // "result": "stick"  or  {"item": "stick", "count": 4}
@@ -63,7 +90,7 @@ inline bool ParseRecipe(const json::Value& v, Recipe& r, std::string& why) {
 
     if (t == "smelting") {
         r.smelting = true;
-        if (!ParseItemRef(v.Find("ingredient"), r.input, why)) { why = "ingredient: " + why; return false; }
+        if (!ParseIngredient(v.Find("ingredient"), tags, r.input, why)) { why = "ingredient: " + why; return false; }
         if (const json::Value* c = v.Find("cookingtime")) {
             if (!c->IsNumber() || c->number < 1) { why = "cookingtime must be a positive number of ticks"; return false; }
             r.cookTime = (int)c->number;
@@ -78,11 +105,10 @@ inline bool ParseRecipe(const json::Value& v, Recipe& r, std::string& why) {
             return false;
         }
         for (const json::Value& e : list->array) {
-            uint8_t id;
-            if (!ParseItemRef(&e, id, why)) { why = "ingredients: " + why; return false; }
-            r.ingredients.push_back(id);
+            Ingredient in;
+            if (!ParseIngredient(&e, tags, in, why)) { why = "ingredients: " + why; return false; }
+            r.ingredients.push_back(in);
         }
-        std::sort(r.ingredients.begin(), r.ingredients.end());
         return true;
     }
     if (t != "shaped") { why = "type must be \"shaped\", \"shapeless\" or \"smelting\""; return false; }
@@ -96,7 +122,7 @@ inline bool ParseRecipe(const json::Value& v, Recipe& r, std::string& why) {
     if (!key || !key->IsObject()) { why = "shaped recipes need a \"key\" object"; return false; }
 
     // Fill a 3x3 grid, then trim empty rows/columns so the pattern can float
-    uint8_t grid[3][3] = {};
+    Ingredient grid[3][3];
     size_t width = 0;
     for (size_t r0 = 0; r0 < pattern->array.size(); ++r0) {
         const json::Value& row = pattern->array[r0];
@@ -108,13 +134,13 @@ inline bool ParseRecipe(const json::Value& v, Recipe& r, std::string& why) {
             if (ch == ' ') continue;
             const json::Value* item = key->Find(std::string(1, ch));
             if (!item) { why = std::string("pattern uses '") + ch + "' but the key doesn't define it"; return false; }
-            if (!ParseItemRef(item, grid[r0][c], why)) { why = std::string("key '") + ch + "': " + why; return false; }
+            if (!ParseIngredient(item, tags, grid[r0][c], why)) { why = std::string("key '") + ch + "': " + why; return false; }
         }
     }
     int x0 = 3, y0 = 3, x1 = -1, y1 = -1;
     for (int y = 0; y < 3; ++y)
         for (int x = 0; x < 3; ++x)
-            if (grid[y][x]) { x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y); }
+            if (!grid[y][x].empty()) { x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y); }
     if (x1 < 0) { why = "pattern is empty"; return false; }
     r.w = x1 - x0 + 1;
     r.h = y1 - y0 + 1;
@@ -123,8 +149,27 @@ inline bool ParseRecipe(const json::Value& v, Recipe& r, std::string& why) {
     return true;
 }
 
+// Can every item be given its own ingredient? (tiny backtracking search;
+// tags mean one item could fit several ingredients)
+inline bool MatchShapeless(const std::vector<Ingredient>& want, const std::vector<uint8_t>& items) {
+    if (want.size() != items.size()) return false;
+    std::vector<bool> used(want.size(), false);
+    std::function<bool(size_t)> place = [&](size_t i) {
+        if (i == items.size()) return true;
+        for (size_t k = 0; k < want.size(); ++k)
+            if (!used[k] && Accepts(want[k], items[i])) {
+                used[k] = true;
+                if (place(i + 1)) return true;
+                used[k] = false;
+            }
+        return false;
+    };
+    return place(0);
+}
+
 struct RecipeBook {
     std::vector<Recipe> recipes;
+    TagMap tags;
 
     // Problems (bad recipes are skipped, not fatal) are appended to `log`.
     // Returns false if the file can't be read or isn't valid JSON.
@@ -140,14 +185,30 @@ struct RecipeBook {
         const json::Value* list = root.Find("recipes");
         if (!list || !list->IsArray()) { log += path + ": expected a top-level \"recipes\" array\n"; return false; }
 
+        // "tags": {"planks": ["oak_planks", "spruce_planks", ...]}
+        TagMap loadedTags;
+        if (const json::Value* t = root.Find("tags")) {
+            for (size_t i = 0; t->IsObject() && i < t->keys.size(); ++i) {
+                Ingredient members;
+                for (const json::Value& e : t->array[i].array) {
+                    uint8_t id;
+                    std::string why;
+                    if (ParseItemRef(&e, id, why)) members.push_back(id);
+                    else log += path + ": tag #" + t->keys[i] + ": " + why + " (skipped)\n";
+                }
+                loadedTags[t->keys[i]] = members;
+            }
+        }
+
         std::vector<Recipe> loaded;
         for (size_t i = 0; i < list->array.size(); ++i) {
             Recipe r;
             std::string why;
-            if (ParseRecipe(list->array[i], r, why)) loaded.push_back(r);
+            if (ParseRecipe(list->array[i], loadedTags, r, why)) loaded.push_back(r);
             else log += path + ": recipe #" + std::to_string(i + 1) + ": " + why + " (skipped)\n";
         }
         recipes = std::move(loaded);
+        tags = std::move(loadedTags);
         return true;
     }
 
@@ -164,13 +225,13 @@ struct RecipeBook {
                     y0 = std::min(y0, y); y1 = std::max(y1, y);
                 }
         if (items.empty()) return nullptr;
-        std::sort(items.begin(), items.end());
         const int w = x1 - x0 + 1, h = y1 - y0 + 1;
 
+        auto fits = [](const Ingredient& in, uint8_t g) { return in.empty() ? g == AIR : Accepts(in, g); };
         for (const Recipe& r : recipes) {
             if (r.smelting) continue;
             if (!r.shaped) {
-                if (r.ingredients == items) return &r;
+                if (MatchShapeless(r.ingredients, items)) return &r;
                 continue;
             }
             if (r.w != w || r.h != h) continue;
@@ -178,8 +239,8 @@ struct RecipeBook {
             for (int y = 0; y < h; ++y)
                 for (int x = 0; x < w; ++x) {
                     uint8_t g = at(y0 + y, x0 + x);
-                    if (g != r.cells[y * w + x])           same = false;
-                    if (g != r.cells[y * w + (w - 1 - x)]) mirrored = false;
+                    if (!fits(r.cells[y * w + x], g))           same = false;
+                    if (!fits(r.cells[y * w + (w - 1 - x)], g)) mirrored = false;
                 }
             if (same || mirrored) return &r;
         }
@@ -189,7 +250,7 @@ struct RecipeBook {
     // The furnace recipe that cooks this item, or nullptr
     const Recipe* Smelting(uint8_t item) const {
         for (const Recipe& r : recipes)
-            if (r.smelting && r.input == item) return &r;
+            if (r.smelting && Accepts(r.input, item)) return &r;
         return nullptr;
     }
 };

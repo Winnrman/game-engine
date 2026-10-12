@@ -52,6 +52,8 @@
 #include "game.h"
 #include "atlas.h"
 #include "recipes.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "pack.h"
 
 #ifndef MYENGINE_ASSETS
 #define MYENGINE_ASSETS "assets"   // CMake points this at the source tree
@@ -146,16 +148,17 @@ layout(location=1) in vec2  aUV;
 layout(location=2) in vec3  aNormal;
 layout(location=3) in float aAO;
 layout(location=4) in vec2  aLight;      // (sky, block) light levels, 0..15
+layout(location=5) in vec3  aTint;       // biome color for grass, leaves and water; white otherwise
 uniform mat4 uViewProj;
-out vec2 vUV; out vec3 vNormal; out float vAO; out vec2 vLight; out vec3 vWorld;
+out vec2 vUV; out vec3 vNormal; out float vAO; out vec2 vLight; out vec3 vWorld; out vec3 vTint;
 void main() {
     gl_Position = uViewProj * vec4(aPos, 1.0);
-    vUV = aUV; vNormal = aNormal; vAO = aAO; vLight = aLight; vWorld = aPos;
+    vUV = aUV; vNormal = aNormal; vAO = aAO; vLight = aLight; vWorld = aPos; vTint = aTint;
 }
 )";
 static const char* BLOCK_FS = R"(
 #version 330 core
-in vec2 vUV; in vec3 vNormal; in float vAO; in vec2 vLight; in vec3 vWorld;
+in vec2 vUV; in vec3 vNormal; in float vAO; in vec2 vLight; in vec3 vWorld; in vec3 vTint;
 out vec4 FragColor;
 uniform sampler2D uAtlas;
 uniform vec3  uSunDir;
@@ -190,7 +193,7 @@ void main() {
     float facing = 0.56 + 0.12 * n.y + 0.42 * mix(0.6, sun, skyF * uDaylight);
     vec3  light  = LightColor(vLight) * facing * vAO;
 
-    vec3 col = tex.rgb * light;
+    vec3 col = tex.rgb * vTint * light;
     float d   = length(vWorld.xz - uCamPos.xz);              // cylindrical fog, like Minecraft
     float fog = clamp((d - uFogStart) / (uFogEnd - uFogStart), 0.0, 1.0);
     col = mix(col, uFogColor, fog);
@@ -315,6 +318,7 @@ static bool ShouldDrawFace(uint8_t self, uint8_t nb, int ny) {
     if (Info(nb).opaque) return false;
     if (self == WATER) return nb != WATER;
     if (self == GLASS) return nb != GLASS;
+    if (self == ICE)   return nb != ICE;
     return true;                              // includes leaves next to leaves (fancy leaves)
 }
 
@@ -332,19 +336,74 @@ static void SubUV(int tile, float px0, float py0, float px1, float py1, float& u
     v0 = bv + (16.0f - py1) / 16.0f * t + e; v1 = bv + (16.0f - py0) / 16.0f * t - e;   // v0 = bottom edge
 }
 
-// One block-vertex: pos3 uv2 normal3 ao1 light2
-static void PushBlockVert(std::vector<float>& out, Vec3 p, float u, float v, Vec3 n, float ao, float sky, float blk) {
-    out.insert(out.end(), {p.x, p.y, p.z, u, v, n.x, n.y, n.z, ao, sky, blk});
+// One block-vertex: pos3 uv2 normal3 ao1 light2 tint3
+static void PushBlockVert(std::vector<float>& out, Vec3 p, float u, float v, Vec3 n, float ao, float sky, float blk,
+                          Vec3 tint = {1, 1, 1}) {
+    out.insert(out.end(), {p.x, p.y, p.z, u, v, n.x, n.y, n.z, ao, sky, blk, tint.x, tint.y, tint.z});
+}
+
+static Vec3 Rgb(uint32_t c) { return {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f}; }
+
+// The biome tint a block's face gets (white = untinted). face: FACES index
+static Vec3 FaceTint(const World& w, uint8_t b, int face, int x, int z) {
+    if (b == GRASS && face == 2) return Rgb(w.GrassAt(x, z));
+    if (b == LEAVES)             return Rgb(w.FoliageAt(x, z));
+    if (b == SPRUCE_LEAVES)      return Rgb(SPRUCE_FOLIAGE);
+    if (b == BIRCH_LEAVES)       return Rgb(BIRCH_FOLIAGE);
+    if (b == WATER)              return Rgb(w.WaterAt(x, z));
+    return {1, 1, 1};
 }
 
 // A quad (corners bottom-left, bottom-right, top-right, top-left of its
 // texture), wound so it faces along n whatever order the corners came in
+// Colors for blocks shown outside the world (icons, dropped items): plains
+static Vec3 IconTint(uint8_t b) {
+    if (b == GRASS)         return Rgb(BiomeData(PLAINS).grass);
+    if (b == LEAVES)        return Rgb(BiomeData(PLAINS).foliage);
+    if (b == SPRUCE_LEAVES) return Rgb(SPRUCE_FOLIAGE);
+    if (b == BIRCH_LEAVES)  return Rgb(BIRCH_FOLIAGE);
+    if (b == WATER)         return Rgb(BiomeData(PLAINS).water);
+    return {1, 1, 1};
+}
+
 static void PushBlockQuad(std::vector<float>& out, Vec3 q[4], float u0, float v0, float u1, float v1, Vec3 n,
-                          float sky, float blk) {
+                          float sky, float blk, Vec3 tint = {1, 1, 1}) {
     const float uv[4][2] = {{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}};
     int order[6] = {0, 1, 2, 2, 3, 0};
     if (Dot(Cross(q[1] - q[0], q[2] - q[0]), n) < 0) { order[1] = 2; order[2] = 1; order[4] = 0; order[5] = 3; }
-    for (int k : order) PushBlockVert(out, q[k], uv[k][0], uv[k][1], n, 1.0f, sky, blk);
+    for (int k : order) PushBlockVert(out, q[k], uv[k][0], uv[k][1], n, 1.0f, sky, blk, tint);
+}
+
+// Blocks that aren't full cubes: the snow layer (2px tall) and cactus
+// (sides pulled in 1px). Lit flat by their own cell; faces against solid
+// blocks are skipped like normal faces.
+static void AddShapeMesh(std::vector<float>& out, const World& w, uint8_t b, int x, int y, int z) {
+    const float p = 1.0f / 16.0f;
+    const BlockInfo& bi = Info(b);
+    const float sky = (float)w.SkyLight(x, y, z), blk = (float)w.BlockLight(x, y, z);
+    // Box in block-local units, and how far the sides sit in from the cell edge
+    float top = b == SNOW ? 2 * p : 1.0f, inset = b == CACTUS ? p : 0.0f;
+    for (int f = 0; f < 6; ++f) {
+        const FaceDef& F = FACES[f];
+        const bool onEdge = (F.n[1] != 0) ? (F.n[1] < 0 || top >= 1.0f) : inset == 0.0f;
+        if (onEdge && !ShouldDrawFace(b, w.Get(x + F.n[0], y + F.n[1], z + F.n[2]), y + F.n[1])) continue;
+        int tile = f == 2 ? bi.tileTop : (f == 3 ? bi.tileBottom : bi.tileSide);
+        float u0, v0, u1, v1;
+        if (F.n[1] == 0) SubUV(tile, 0, 16 - top * 16, 16, 16, u0, v0, u1, v1);   // sides show the bottom strip
+        else             TileUV(tile, u0, v0, u1, v1);
+        Vec3 q[4];
+        for (int i = 0; i < 4; ++i) {
+            const int* c = F.c[i];
+            float lx = c[0] ? 1.0f : 0.0f, ly = c[1] ? top : 0.0f, lz = c[2] ? 1.0f : 0.0f;
+            if (F.n[0] == 0) lx = c[0] ? 1.0f - inset : inset;    // pull side faces in...
+            else             lx = F.n[0] > 0 ? 1.0f - inset : inset;
+            if (F.n[2] == 0) lz = c[2] ? 1.0f - inset : inset;
+            else             lz = F.n[2] > 0 ? 1.0f - inset : inset;
+            if (F.n[1] != 0) { lx = (float)c[0]; lz = (float)c[2]; }  // ...but tops and bottoms stay full size
+            q[i] = {x + lx, y + ly, z + lz};
+        }
+        PushBlockQuad(out, q, u0, v0, u1, v1, {(float)F.n[0], (float)F.n[1], (float)F.n[2]}, sky, blk);
+    }
 }
 
 // Minecraft's torch model: a 2x10-pixel stick. Wall torches lean 22.5 degrees
@@ -387,8 +446,11 @@ static void BuildChunk(const World& w, int cx, int cz, std::vector<float>& solid
         uint8_t b = w.blocks[World::Idx(x, y, z)];
         if (b == AIR) continue;
         if (IsTorch(b)) { AddTorchMesh(solid, w, b, x, y, z); continue; }
+        if (b == SNOW || b == CACTUS) { AddShapeMesh(solid, w, b, x, y, z); continue; }
         const BlockInfo& bi = Info(b);
         const bool isWater = b == WATER;
+        const bool translucent = bi.translucent;          // water and ice go in the blended pass
+        const bool snowCapped = b == GRASS && w.Get(x, y + 1, z) == SNOW;
         const float topH = (isWater && w.Get(x, y + 1, z) != WATER) ? 0.875f : 1.0f;
 
         for (int f = 0; f < 6; ++f) {
@@ -399,7 +461,9 @@ static void BuildChunk(const World& w, int cx, int cz, std::vector<float>& solid
             int tile = f == 2 ? bi.tileTop : (f == 3 ? bi.tileBottom : bi.tileSide);
             static const int FRONT_FACE[4] = {0, 1, 4, 5};   // facing +X, -X, +Z, -Z -> FACES index
             if (IsFurnace(b) && f == FRONT_FACE[FurnaceFacing(b)]) tile = IsLitFurnace(b) ? T_FURNACE_FRONT_LIT : T_FURNACE_FRONT;
+            if (snowCapped && F.n[1] == 0) tile = T_GRASS_SNOW_SIDE;
             float u0, v0, u1, v1; TileUV(tile, u0, v0, u1, v1);
+            const Vec3 tint = FaceTint(w, b, f, x, z);
 
             int na = F.n[0] ? 0 : (F.n[1] ? 1 : 2);
             int a1 = (na + 1) % 3, a2 = (na + 2) % 3;
@@ -438,19 +502,21 @@ static void BuildChunk(const World& w, int cx, int cz, std::vector<float>& solid
             for (int i = 0; i < 4; ++i) br[i] = ao[i] * (std::max(sky[i], blk[i]) + 1.0f);
             const int* order = (br[0] + br[2] < br[1] + br[3]) ? ORDER_B : ORDER_A;
 
-            std::vector<float>& out = isWater ? water : solid;
-            for (int k = 0; k < 6; ++k) {
-                int i = order[k];
-                const int* c = F.c[i];
-                out.push_back((float)(x + c[0]));
-                out.push_back(y + (c[1] ? topH : 0.0f));
-                out.push_back((float)(z + c[2]));
-                out.push_back((i == 0 || i == 3) ? u0 : u1);
-                out.push_back(i < 2 ? v0 : v1);
-                out.push_back((float)F.n[0]); out.push_back((float)F.n[1]); out.push_back((float)F.n[2]);
-                out.push_back(ao[i]);
-                out.push_back(sky[i]);
-                out.push_back(blk[i]);
+            std::vector<float>& out = translucent ? water : solid;
+            auto emit = [&](float eu0, float ev0, float eu1, float ev1, Vec3 t) {
+                for (int k = 0; k < 6; ++k) {
+                    int i = order[k];
+                    const int* c = F.c[i];
+                    Vec3 pos = {(float)(x + c[0]), y + (c[1] ? topH : 0.0f), (float)(z + c[2])};
+                    PushBlockVert(out, pos, (i == 0 || i == 3) ? eu0 : eu1, i < 2 ? ev0 : ev1,
+                                  {(float)F.n[0], (float)F.n[1], (float)F.n[2]}, ao[i], sky[i], blk[i], t);
+                }
+            };
+            emit(u0, v0, u1, v1, tint);
+            // Grass sides: the tinted grassy fringe goes on top of the dirt
+            if (b == GRASS && F.n[1] == 0 && !snowCapped) {
+                float ou0, ov0, ou1, ov1; TileUV(T_GRASS_OVERLAY, ou0, ov0, ou1, ov1);
+                emit(ou0, ov0, ou1, ov1, Rgb(w.GrassAt(x, z)));
             }
         }
     }
@@ -533,7 +599,8 @@ static void AddItemCube(std::vector<float>& v, Vec3 c, float h, float yaw, uint8
             uv[i][1] = i < 2 ? v0 : v1;
         }
         float s = SHADE[f] * light;
-        for (int k : ORDER) PushV(v, pts[k], uv[k][0], uv[k][1], s, s, s, 1);
+        Vec3 t = (f == 2 || block != GRASS) ? IconTint(block) : Vec3{1, 1, 1};
+        for (int k : ORDER) PushV(v, pts[k], uv[k][0], uv[k][1], s * t.x, s * t.y, s * t.z, 1);
     }
 }
 
@@ -631,11 +698,11 @@ struct Hud {
         Rect(x0, y0 + t, x0 + t, y1 - t, r, g, b, a); Rect(x1 - t, y0 + t, x1, y1 - t, r, g, b, a);
     }
     // Textured quad from 4 points: bottom-left, bottom-right, top-right, top-left (of the texture)
-    void TileQuad(const float p[4][2], int tile, float shade) {
+    void TileQuad(const float p[4][2], int tile, float shade, Vec3 tint = {1, 1, 1}) {
         float u0, v0, u1, v1; TileUV(tile, u0, v0, u1, v1);
         const float uv[4][2] = {{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}};
         static const int ORDER[6] = {0, 1, 2, 2, 3, 0};
-        for (int k : ORDER) Vert(p[k][0], p[k][1], uv[k][0], uv[k][1], shade, shade, shade, 1);
+        for (int k : ORDER) Vert(p[k][0], p[k][1], uv[k][0], uv[k][1], shade * tint.x, shade * tint.y, shade * tint.z, 1);
     }
     // Little isometric cube, like inventory icons
     void BlockIcon(uint8_t b, float cx, float cy, float s) {
@@ -646,9 +713,15 @@ struct Hud {
         const float top[4][2]   = {{lT[0], lT[1]}, {mid[0], mid[1]}, {rT[0], rT[1]}, {topC[0], topC[1]}};
         const float left[4][2]  = {{lB[0], lB[1]}, {bot[0], bot[1]}, {mid[0], mid[1]}, {lT[0], lT[1]}};
         const float right[4][2] = {{bot[0], bot[1]}, {rB[0], rB[1]}, {rT[0], rT[1]}, {mid[0], mid[1]}};
-        TileQuad(left, IsFurnace(b) ? (IsLitFurnace(b) ? T_FURNACE_FRONT_LIT : T_FURNACE_FRONT) : bi.tileSide, 0.78f);
-        TileQuad(right, bi.tileSide, 0.6f);
-        TileQuad(top, bi.tileTop, 1.0f);
+        Vec3 tint = IconTint(b);
+        TileQuad(left, IsFurnace(b) ? (IsLitFurnace(b) ? T_FURNACE_FRONT_LIT : T_FURNACE_FRONT) : bi.tileSide, 0.78f,
+                 b == GRASS ? Vec3{1, 1, 1} : tint);
+        TileQuad(right, bi.tileSide, 0.6f, b == GRASS ? Vec3{1, 1, 1} : tint);
+        if (b == GRASS) {   // grassy fringe over the dirt sides
+            TileQuad(left, T_GRASS_OVERLAY, 0.78f, tint);
+            TileQuad(right, T_GRASS_OVERLAY, 0.6f, tint);
+        }
+        TileQuad(top, bi.tileTop, 1.0f, tint);
     }
     // Blocks get the cube, everything else a flat sprite
     void ItemIcon(uint8_t item, float cx, float cy, float s) {
@@ -793,17 +866,19 @@ static atlas::Image gAtlasPixels;           // CPU copy of the atlas, for partic
 static const size_t MAX_PARTICLES = 4000;
 
 // The color of a random opaque pixel of one of the block's textures
-static void BlockPixelColor(uint8_t b, float& r, float& g, float& bl) {
+static void BlockPixelColor(uint8_t b, float& r, float& g, float& bl, int wx = 0, int wz = 0) {
     const BlockInfo& bi = Info(b);
     int tiles[3] = {bi.tileTop, bi.tileSide, bi.tileBottom};
-    int tile = tiles[(int)(Rand01() * 3) % 3];
+    int pickFace = (int)(Rand01() * 3) % 3;
+    int tile = tiles[pickFace];
+    Vec3 tint = (gWorld && (b != GRASS || pickFace == 0)) ? FaceTint(*gWorld, b, pickFace == 0 ? 2 : 0, wx, wz) : Vec3{1, 1, 1};
     r = g = bl = 0.5f;
     for (int tries = 0; tries < 12; ++tries) {
         int col = (tile % atlas::GRID) * atlas::TILE + (int)(Rand01() * atlas::TILE);
         int row = (tile / atlas::GRID) * atlas::TILE + (int)(Rand01() * atlas::TILE);
         const uint8_t* px = &gAtlasPixels.px[((size_t)row * atlas::SIZE + col) * 4];
         if (px[3] < 128) continue;
-        r = px[0] / 255.0f; g = px[1] / 255.0f; bl = px[2] / 255.0f;
+        r = px[0] / 255.0f * tint.x; g = px[1] / 255.0f * tint.y; bl = px[2] / 255.0f * tint.z;
         return;
     }
 }
@@ -820,7 +895,7 @@ static Particle& AddBlockParticle(double x, double y, double z, double xa, doubl
     q.vx = vx / len * speed * 0.4; q.vy = vy / len * speed * 0.4 + 0.1; q.vz = vz / len * speed * 0.4;
     q.size = 0.1f * (float)(Rand01() * 0.5 + 0.5);
     q.life = (int)(4.0 / (Rand01() * 0.9 + 0.1));
-    BlockPixelColor(b, q.r, q.g, q.b);
+    BlockPixelColor(b, q.r, q.g, q.b, (int)std::floor(x), (int)std::floor(z));
     if (gParticles.size() >= MAX_PARTICLES) gParticles.erase(gParticles.begin());
     gParticles.push_back(q);
     return gParticles.back();
@@ -992,19 +1067,16 @@ static void SetBlock(int x, int y, int z, uint8_t b) {
     }
     if (IsFurnace(b)) gFurnaces[FurnaceKey(x, y, z)];   // make sure it has a state
 
-    if (!CanHoldTorch(b)) {
-        static const int N[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-        for (const auto& n : N) {
-            int tx = x + n[0], ty = y + n[1], tz = z + n[2];
-            uint8_t t = w.Get(tx, ty, tz);
-            if (!IsTorch(t)) continue;
-            int sx, sy, sz;
-            TorchSupport(t, tx, ty, tz, sx, sy, sz);
-            if (sx != x || sy != y || sz != z) continue;
-            SpawnBreakParticles(tx, ty, tz, t);
-            SetBlock(tx, ty, tz, AIR);
-            DropFromBlock(gItems, tx, ty, tz, {TORCH, 1});
-        }
+    // Neighbors that can't stay without this block pop off (torches, cactus, snow)
+    static const int N[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    for (const auto& n : N) {
+        int tx = x + n[0], ty = y + n[1], tz = z + n[2];
+        uint8_t t = w.Get(tx, ty, tz);
+        if (t == AIR || CanSurvive(w, t, tx, ty, tz)) continue;
+        SpawnBreakParticles(tx, ty, tz, t);
+        SetBlock(tx, ty, tz, AIR);
+        Stack drop = BlockDrop(t);   // cactus drops itself, torches a torch, snow nothing
+        if (drop.count > 0) DropFromBlock(gItems, tx, ty, tz, drop);
     }
 }
 
@@ -1383,7 +1455,7 @@ static void TickInteraction() {
                 if (dmg < 1.0) SpawnHitParticle(h.x, h.y, h.z, h.nx, h.ny, h.nz, b);
                 if (gBreakProgress >= 1.0 - 1e-6) {
                     SpawnBreakParticles(h.x, h.y, h.z, b);
-                    SetBlock(h.x, h.y, h.z, AIR);
+                    SetBlock(h.x, h.y, h.z, b == ICE ? (uint8_t)WATER : (uint8_t)AIR);   // ice melts in survival
                     Stack drop = BlockDrop(b, tool);
                     if (drop.count > 0) DropFromBlock(gItems, h.x, h.y, h.z, drop);
                     // Tools wear 1 per block (2 for swords), except on instant-break blocks
@@ -1430,6 +1502,7 @@ static void TickInteraction() {
     if (gPlaceDelay > 0) --gPlaceDelay;
     if (h.hit && IsPlaceable(held) && (gRmbLatch || (rmbHeld && gPlaceDelay == 0)) && (h.nx | h.ny | h.nz)) {
         int tx = h.x + h.nx, ty = h.y + h.ny, tz = h.z + h.nz;
+        if (w.Get(h.x, h.y, h.z) == SNOW) { tx = h.x; ty = h.y; tz = h.z; }   // placing on snow replaces it
         uint8_t cur = w.Get(tx, ty, tz);
         AABB cell = {(double)tx, (double)ty, (double)tz, tx + 1.0, ty + 1.0, tz + 1.0};
         bool blocked = Info(held).solid && Overlaps(p.Box(), cell);
@@ -1440,7 +1513,8 @@ static void TickInteraction() {
         } else if (IsFurnace(held)) {
             place = FurnaceBlock(FacingToward(d.x, d.z), false);   // front faces you
         }
-        if (place != AIR && World::InXZ(tx, tz) && ty >= 0 && ty < WY && (cur == AIR || cur == WATER) && !blocked) {
+        if (place != AIR && !IsTorch(place) && !CanSurvive(w, place, tx, ty, tz)) place = AIR;   // e.g. cactus off sand
+        if (place != AIR && World::InXZ(tx, tz) && ty >= 0 && ty < WY && (cur == AIR || cur == WATER || cur == SNOW) && !blocked) {
             SetBlock(tx, ty, tz, place);
             if (!p.creative) gInv.Take(gSelected, 1);
         }
@@ -1736,6 +1810,10 @@ int main(int argc, char** argv) {
     GLuint atlasTex;
     {
         atlas::Image img = atlas::Build();
+        for (const std::string& dir : {std::string("assets/pack"), std::string(MYENGINE_ASSETS) + "/pack"}) {
+            int n = pack::Load(img, dir);
+            if (n > 0) { std::printf("Texture pack: %d textures from %s\n", n, dir.c_str()); break; }
+        }
         gAtlasPixels = img;
         glGenTextures(1, &atlasTex);
         glBindTexture(GL_TEXTURE_2D, atlasTex);
@@ -1750,8 +1828,8 @@ int main(int argc, char** argv) {
 
     for (int cx = 0; cx < CHUNKS_X; ++cx)
         for (int cz = 0; cz < CHUNKS_Z; ++cz) {
-            gChunks[cx][cz].solid.Init({3, 2, 3, 1, 2});
-            gChunks[cx][cz].water.Init({3, 2, 3, 1, 2});
+            gChunks[cx][cz].solid.Init({3, 2, 3, 1, 2, 3});
+            gChunks[cx][cz].water.Init({3, 2, 3, 1, 2, 3});
         }
     t0 = glfwGetTime();
     RebuildDirtyChunks(*gWorld);
@@ -1940,6 +2018,7 @@ int main(int argc, char** argv) {
         glUniform1f(bFogStart, fogStart);
         glUniform1f(bFogEnd, fogEnd);
         glUniform1i(bTransl, 0);
+        glDepthFunc(GL_LEQUAL);   // grass overlays sit exactly on their dirt faces
         for (int cx = 0; cx < CHUNKS_X; ++cx)
             for (int cz = 0; cz < CHUNKS_Z; ++cz) {
                 float dx = cx * CHUNK + 8 - camPos.x, dz = cz * CHUNK + 8 - camPos.z;
@@ -2233,8 +2312,9 @@ int main(int argc, char** argv) {
                                                p.health, p.food, p.saturation, p.exhaustion);
                 long long tod = gDayTime % DAY_TICKS;                        // 0 = 6:00
                 int hour = (int)((tod / 1000 + 6) % 24), minute = (int)(tod % 1000 * 60 / 1000);
-                std::snprintf(buf, sizeof buf, "MyEngine | %d fps | Day %lld %02d:%02d | XYZ %.2f / %.2f / %.2f | Facing %s | %.2f m/s%s | %s%s | Holding %s | Items %d%s | Seed %u",
-                              fps, gDayTime / DAY_TICKS + 1, hour, minute, p.x, p.y, p.z, facing, hs, state.c_str(), mode, stats, held,
+                const char* biomeName = BiomeData(gWorld->BiomeAt((int)std::floor(p.x), (int)std::floor(p.z))).name;
+                std::snprintf(buf, sizeof buf, "MyEngine | %d fps | Day %lld %02d:%02d | %s | XYZ %.2f / %.2f / %.2f | Facing %s | %.2f m/s%s | %s%s | Holding %s | Items %d%s | Seed %u",
+                              fps, gDayTime / DAY_TICKS + 1, hour, minute, biomeName, p.x, p.y, p.z, facing, hs, state.c_str(), mode, stats, held,
                               (int)gItems.size(), look, seed);
             } else {
                 std::snprintf(buf, sizeof buf, "MyEngine | %s | Holding %s", mode, held);
