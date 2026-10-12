@@ -1,0 +1,157 @@
+{
+  "_help": [
+    "Crafting recipes. Loaded at startup; press F6 in game to reload.",
+    "shaped: 'pattern' is up to 3 rows of up to 3 characters (space = empty) and 'key' maps each character to an item id.",
+    "  The shape can sit anywhere in the grid and can be mirrored. Anything that fits in 2x2 also works in the inventory (E).",
+    "shapeless: 'ingredients' lists the items, in any arrangement.",
+    "smelting: a furnace recipe with one 'ingredient'; 'cookingtime' in ticks (default 200 = 10 s).",
+    "result: an item id, or {'item': id, 'count': n}.",
+    "Item ids: grass_block dirt stone cobblestone oak_log oak_leaves oak_planks sand glass bricks coal_ore iron_ore",
+    "  crate crafting_table torch apple stick coal wooden_pickaxe wooden_axe wooden_shovel wooden_sword",
+    "  stone_pickaxe stone_axe stone_shovel stone_sword diamond_ore emerald_ore diamond emerald",
+    "  furnace iron_ingot iron_pickaxe iron_axe iron_shovel iron_sword"
+  ],
+  "recipes": [
+    {
+      "type": "shapeless",
+      "ingredients": ["oak_log"],
+      "result": {"item": "oak_planks", "count": 4}
+    },
+    {
+      "type": "shaped",
+      "pattern": ["#",
+                  "#"],
+      "key": {"#": "oak_planks"},
+      "result": {"item": "stick", "count": 4}
+    },
+    {
+      "type": "shaped",
+      "pattern": ["##",
+                  "##"],
+      "key": {"#": "oak_planks"},
+      "result": "crafting_table"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["C",
+                  "#"],
+      "key": {"C": "coal", "#": "stick"},
+      "result": {"item": "torch", "count": 4}
+    },
+
+    {
+      "type": "shaped",
+      "pattern": ["XXX",
+                  " # ",
+                  " # "],
+      "key": {"X": "oak_planks", "#": "stick"},
+      "result": "wooden_pickaxe"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["XX",
+                  "X#",
+                  " #"],
+      "key": {"X": "oak_planks", "#": "stick"},
+      "result": "wooden_axe"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["X",
+                  "#",
+                  "#"],
+      "key": {"X": "oak_planks", "#": "stick"},
+      "result": "wooden_shovel"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["X",
+                  "X",
+                  "#"],
+      "key": {"X": "oak_planks", "#": "stick"},
+      "result": "wooden_sword"
+    },
+
+    {
+      "type": "shaped",
+      "pattern": ["XXX",
+                  " # ",
+                  " # "],
+      "key": {"X": "cobblestone", "#": "stick"},
+      "result": "stone_pickaxe"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["XX",
+                  "X#",
+                  " #"],
+      "key": {"X": "cobblestone", "#": "stick"},
+      "result": "stone_axe"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["X",
+                  "#",
+                  "#"],
+      "key": {"X": "cobblestone", "#": "stick"},
+      "result": "stone_shovel"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["X",
+                  "X",
+                  "#"],
+      "key": {"X": "cobblestone", "#": "stick"},
+      "result": "stone_sword"
+    },
+
+    {
+      "type": "shaped",
+      "pattern": ["###",
+                  "# #",
+                  "###"],
+      "key": {"#": "cobblestone"},
+      "result": "furnace"
+    },
+
+    {
+      "type": "shaped",
+      "pattern": ["XXX",
+                  " # ",
+                  " # "],
+      "key": {"X": "iron_ingot", "#": "stick"},
+      "result": "iron_pickaxe"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["XX",
+                  "X#",
+                  " #"],
+      "key": {"X": "iron_ingot", "#": "stick"},
+      "result": "iron_axe"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["X",
+                  "#",
+                  "#"],
+      "key": {"X": "iron_ingot", "#": "stick"},
+      "result": "iron_shovel"
+    },
+    {
+      "type": "shaped",
+      "pattern": ["X",
+                  "X",
+                  "#"],
+      "key": {"X": "iron_ingot", "#": "stick"},
+      "result": "iron_sword"
+    },
+
+    {"type": "smelting", "ingredient": "iron_ore",    "result": "iron_ingot"},
+    {"type": "smelting", "ingredient": "sand",        "result": "glass"},
+    {"type": "smelting", "ingredient": "cobblestone", "result": "stone"},
+    {"type": "smelting", "ingredient": "coal_ore",    "result": "coal"},
+    {"type": "smelting", "ingredient": "diamond_ore", "result": "diamond"},
+    {"type": "smelting", "ingredient": "emerald_ore", "result": "emerald"}
+  ]
+}
