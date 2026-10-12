@@ -2,6 +2,7 @@
 // Build: g++ -std=c++17 -O2 -I../src physics_test.cpp -o physics_test
 #include "game.h"
 #include "recipes.h"
+#include "save.h"
 #include <cstdio>
 #include <fstream>
 #include <initializer_list>
@@ -612,6 +613,83 @@ int main() {
         if (!ok) ++fails;
         check("Hand: Snow s", BreakTicks(SNOW) / 20.0, 0.5, 1e-9);
         check("Hand: Ice s", BreakTicks(ICE) / 20.0, 0.75, 1e-9);
+    }
+
+    // ---- Saving and loading ----
+    {
+        namespace fs = std::filesystem;
+        const std::string root = (fs::temp_directory_path() / "myengine_save_test").generic_string();
+        fs::remove_all(root);
+
+        World a; Generate(a, 1337);
+        a.Set(100, 70, 100, FURNACE_PX);
+        a.Set(101, 70, 100, TORCH);
+        SaveData d;
+        d.name = "Test World";
+        d.dayTime = 31337;
+        d.lastPlayed = 1700000000;
+        d.player.x = 101.25; d.player.y = 70; d.player.z = 99.5;
+        d.player.yaw = 1.5f; d.player.pitch = -0.25f;
+        d.player.health = 13.5; d.player.food = 9; d.player.saturation = 1.25; d.player.air = 120;
+        d.player.creative = true; d.player.flying = true;
+        d.inv.Add(LOG, 20);
+        Stack worn{IRON_PICKAXE, 1}; worn.damage = 37;
+        d.inv.slots[5] = worn;
+        d.creativeBar[0] = SPRUCE_LOG;
+        d.selected = 5;
+        SpawnItem(d.items, 50.5, 70, 50.5, 0.1, 0, 0, {DIAMOND, 3}, 10);
+        FurnaceState f; f.input = {IRON_ORE, 4}; f.fuel = {COAL, 2}; f.output = {IRON_INGOT, 1}; f.litTime = 900; f.litDuration = 1600; f.cookTime = 77;
+        d.furnaces[12345] = f;
+
+        const std::string dir = NewWorldDir(root, "Test World");
+        std::string err;
+        bool saved = SaveWorld(dir, a, d, err);
+        size_t bytes = saved ? (size_t)fs::file_size(dir + "/world.dat") : 0;
+        std::printf("%-28s %9zu bytes  %s\n", "save world", bytes, saved ? "OK" : ("FAIL " + err).c_str());
+        if (!saved) ++fails;
+
+        World b;
+        SaveData e;
+        bool loaded = LoadWorld(dir, b, e, err);
+        RelightAll(a);   // what the original's light should be after those edits
+        bool ok = loaded && b.blocks == a.blocks && b.light == a.light && b.biome == a.biome && b.grassColor == a.grassColor &&
+                  b.seed == 1337 && e.name == "Test World" && e.dayTime == 31337 &&
+                  e.player.x == 101.25 && e.player.yaw == 1.5f && e.player.health == 13.5 && e.player.food == 9 &&
+                  e.player.air == 120 && e.player.creative && e.player.flying &&
+                  e.inv.slots[0].item == LOG && e.inv.slots[0].count == 20 && e.inv.slots[5].damage == 37 &&
+                  e.creativeBar[0] == SPRUCE_LOG && e.selected == 5 &&
+                  e.items.size() == 1 && e.items[0].stack.item == DIAMOND && e.items[0].stack.count == 3 &&
+                  e.furnaces.count(12345) && e.furnaces[12345].cookTime == 77 && e.furnaces[12345].output.item == IRON_INGOT;
+        std::printf("%-28s %9s  %s\n", "load: everything matches", ok ? "yes" : ("no " + err).c_str(), ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        SaveInfo info;
+        ok = ReadSaveInfo(dir, info) && info.name == "Test World" && info.seed == 1337 && info.creative && info.lastPlayed == 1700000000;
+        std::vector<SaveInfo> list = ListSaves(root);
+        ok = ok && list.size() == 1 && NewWorldDir(root, "Test World") == root + "/Test World-2" &&
+             NewWorldDir(root, "a/b:c*") == root + "/a_b_c_";
+        std::printf("%-28s %9s  %s\n", "world list and folders", ok ? "right" : "wrong", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        // A damaged save is refused with a reason instead of crashing
+        std::vector<uint8_t> raw;
+        ReadFile(dir + "/world.dat", raw);
+        { std::ofstream t(dir + "/world.dat", std::ios::binary); t.write((const char*)raw.data(), (std::streamsize)raw.size() / 2); }
+        World c; SaveData g;
+        std::string why;
+        bool refused = !LoadWorld(dir, c, g, why) && !why.empty();
+        { std::ofstream t(dir + "/world.dat", std::ios::binary); t << "not a world at all"; }
+        std::string why2;
+        refused = refused && !LoadWorld(dir, c, g, why2) && why2 == "not a MyEngine world";
+        std::printf("%-28s %9s  %s\n", "damaged save refused", refused ? "yes" : "no", refused ? "OK" : "FAIL");
+        if (!refused) ++fails;
+        fs::remove_all(root);
+
+        uint32_t sd = 0;
+        ok = SeedFromText("1337", sd) && sd == 1337 && SeedFromText("-5", sd) && sd == (uint32_t)-5 &&
+             SeedFromText("hello", sd) && sd == 99162322u && !SeedFromText("   ", sd);   // Java: "hello".hashCode()
+        std::printf("%-28s %9s  %s\n", "seed text", ok ? "as java" : "wrong", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
     }
 
     // Real terrain generation sanity

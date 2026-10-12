@@ -15,9 +15,12 @@
 //   Q             drop one (Ctrl+Q: whole stack)
 //   E             inventory (2x2 crafting)   F6  reload assets/recipes.json
 //   F7            skip ahead 3 hours (a full day is 20 minutes)
+//   Esc           pause menu (save and quit from there)
 //
-// Run with a number to pick the world seed (MyEngine.exe 1337); without one
-// every launch makes a new world.
+// The game opens on a title screen: pick a saved world or create one.
+// Worlds live in saves/<name>/world.dat and autosave every 5 minutes.
+// Run with a number (MyEngine.exe 1337) to jump straight into a new world
+// with that seed.
 //   Right click a crafting table for 3x3 crafting, a furnace to smelt
 //   (sneak to place a block against either)
 //   Double Space  toggle flight (creative)
@@ -47,11 +50,14 @@
 #include <cstring>
 #include <random>
 #include <map>
+#include <ctime>
+#include <functional>
 #include <chrono>
 
 #include "game.h"
 #include "atlas.h"
 #include "recipes.h"
+#include "save.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "pack.h"
 
@@ -676,6 +682,18 @@ static const char* const* Glyph(char c) {
     if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
     if (c >= 'A' && c <= 'Z') return LETTERS[c - 'A'];
     if (c >= '0' && c <= '9') return DIGITS[c - '0'];
+    static const char* const SLASH[5] = {"..#", "..#", ".#.", "#..", "#.."};
+    if (c == '/') return SLASH;
+    static const struct { char c; const char* rows[5]; } PUNCT[] = {
+        {'-', {"...", "...", "###", "...", "..."}}, {'_', {"...", "...", "...", "...", "###"}},
+        {':', {"...", ".#.", "...", ".#.", "..."}}, {'.', {"...", "...", "...", "...", ".#."}},
+        {',', {"...", "...", "...", ".#.", "#.."}}, {'!', {".#.", ".#.", ".#.", "...", ".#."}},
+        {'?', {"##.", "..#", ".#.", "...", ".#."}}, {'\'', {".#.", ".#.", "...", "...", "..."}},
+        {'(', {"..#", ".#.", ".#.", ".#.", "..#"}}, {')', {"#..", ".#.", ".#.", ".#.", "#.."}},
+        {'+', {"...", ".#.", "###", ".#.", "..."}}, {'#', {"#.#", "###", "#.#", "###", "#.#"}},
+        {'"', {"#.#", "#.#", "...", "...", "..."}}, {'=', {"...", "###", "...", "###", "..."}},
+    };
+    for (const auto& g : PUNCT) if (g.c == c) return g.rows;
     return nullptr;   // space and anything else: blank
 }
 
@@ -786,6 +804,7 @@ static GLFWwindow* gWindow = nullptr;
 static int         gFbW = 1280, gFbH = 720;
 
 // Creative uses an infinite block palette; survival uses the real inventory
+static const uint8_t DEFAULT_CREATIVE_BAR[9] = {GRASS, DIRT, STONE, COBBLESTONE, LOG, PLANKS, GLASS, TORCH, CRATE};
 static uint8_t   gCreativeBar[9] = {GRASS, DIRT, STONE, COBBLESTONE, LOG, PLANKS, GLASS, TORCH, CRATE};
 static Inventory gInv;
 static int       gSelected = 0;
@@ -1355,6 +1374,428 @@ static void LoadRecipes() {
 }
 
 // ============================================================================
+// Worlds: start, load, save, leave
+// ============================================================================
+enum class App { Title, Worlds, Create, ConfirmDelete, Playing };
+static App         gApp = App::Title;
+static bool        gPaused = false;
+static std::string gWorldDir, gWorldName;          // the world being played
+static int         gAutosave = 0;                  // ticks since the last save
+static double      gSavedAt = -100;                // when "Saved" was last shown
+static std::string gMenuMessage;                   // e.g. why a world wouldn't load
+static std::function<void(const char*)> gShowMessage;   // draws a "Loading..." frame
+static const char* SAVES_ROOT = "saves";
+
+static void Pause() {
+    if (gApp != App::Playing || gPaused) return;
+    gPaused = true;
+    gLmbLatch = gRmbLatch = gMmbLatch = gDropLatch = false;
+    gBreaking = false; gBreakProgress = 0; gEatTicks = 0;
+    SetCapture(false);
+}
+static void Resume() {
+    if (!gPaused) return;
+    gPaused = false;
+    SetCapture(true);
+}
+
+// Back to a blank slate between worlds
+static void ResetSession() {
+    if (gScreen != Screen::None) CloseScreen(false);
+    gInv = Inventory();
+    gItems.clear();
+    gFurnaces.clear();
+    gOpenFurnace = nullptr;
+    gTorches.clear();
+    gParticles.clear();
+    gCursor = {};
+    for (Stack& st : gGrid) st = {};
+    gOutput = {};
+    gPlayer = Player();
+    gSelected = 0;
+    std::memcpy(gCreativeBar, DEFAULT_CREATIVE_BAR, sizeof gCreativeBar);
+    gDayTime = 1000;
+    gDeadTicks = gEatTicks = 0;
+    gBreaking = false; gBreakProgress = 0; gBreakDelay = gPlaceDelay = 0;
+    gLmbLatch = gRmbLatch = gMmbLatch = gDropLatch = false;
+    gFovMod = gPrevFovMod = 1.0f;
+    gEyeH = gPrevEyeH = (float)EYE_HEIGHT;
+    gPaused = false;
+    gAutosave = 0;
+}
+
+// Writes the world being played. Items in a crafting grid or on the cursor
+// are saved as if they'd been put back in the inventory.
+static bool SaveGame() {
+    if (!gWorld || gWorldDir.empty()) return false;
+    SaveData d;
+    d.name = gWorldName;
+    d.dayTime = gDayTime;
+    d.lastPlayed = (long long)std::time(nullptr);
+    d.player = gPlayer;
+    d.inv = gInv;
+    std::memcpy(d.creativeBar, gCreativeBar, sizeof gCreativeBar);
+    d.selected = gSelected;
+    d.items = gItems;
+    d.furnaces = gFurnaces;
+    std::vector<Stack> loose(std::begin(gGrid), std::end(gGrid));
+    loose.push_back(gCursor);
+    for (Stack st : loose) {
+        d.inv.MoveInto(st, 0, INVENTORY_SLOTS);
+        if (st.count > 0) SpawnItem(d.items, gPlayer.x, gPlayer.y + 1.0, gPlayer.z, 0, 0, 0, st, 10);
+    }
+    std::string err;
+    if (!SaveWorld(gWorldDir, *gWorld, d, err)) {
+        std::printf("Saving failed: %s\n", err.c_str());
+        return false;
+    }
+    gSavedAt = glfwGetTime();
+    std::printf("Saved \"%s\" to %s\n", gWorldName.c_str(), gWorldDir.c_str());
+    return true;
+}
+
+// The world is loaded into gWorld and the globals: get it on screen
+static void EnterWorld() {
+    gTorches.clear();
+    for (int x = 0; x < WX; ++x)
+        for (int z = 0; z < WZ; ++z)
+            for (int y = 0; y < WY; ++y)
+                if (IsTorch(gWorld->blocks[World::Idx(x, y, z)])) gTorches.push_back({x, y, z});
+    MarkDirtyBox(0, 0, WX - 1, WZ - 1);
+    RebuildDirtyChunks(*gWorld);
+    gApp = App::Playing;
+    gPaused = false;
+    gMenuMessage.clear();
+    SetCapture(true);
+}
+
+static void CreateNewWorld(const std::string& name, uint32_t seed, bool creative) {
+    if (gShowMessage) gShowMessage("GENERATING WORLD...");
+    ResetSession();
+    double t0 = glfwGetTime();
+    gWorld = new World();
+    Generate(*gWorld, seed);
+    Spawn(*gWorld, gPlayer);
+    gPlayer.yaw = PI * 0.25f;
+    gPlayer.creative = creative;
+    gWorldName = name;
+    gWorldDir = NewWorldDir(SAVES_ROOT, name);
+    std::printf("Created \"%s\" (seed %u) in %.2fs\n", name.c_str(), seed, glfwGetTime() - t0);
+    SaveGame();
+    EnterWorld();
+}
+
+static void OpenWorld(const SaveInfo& info) {
+    if (gShowMessage) gShowMessage("LOADING WORLD...");
+    ResetSession();
+    World* w = new World();
+    SaveData d;
+    std::string err;
+    if (!LoadWorld(info.dir, *w, d, err)) {
+        delete w;
+        gMenuMessage = "COULDN'T LOAD " + info.name + ": " + err;
+        std::printf("Couldn't load %s: %s\n", info.dir.c_str(), err.c_str());
+        return;
+    }
+    gWorld = w;
+    gPlayer = d.player;
+    gInv = d.inv;
+    std::memcpy(gCreativeBar, d.creativeBar, sizeof gCreativeBar);
+    gSelected = d.selected;
+    gItems = d.items;
+    gFurnaces = d.furnaces;
+    gDayTime = d.dayTime;
+    gWorldName = d.name;
+    gWorldDir = info.dir;
+    std::printf("Loaded \"%s\" from %s\n", gWorldName.c_str(), gWorldDir.c_str());
+    EnterWorld();
+}
+
+static void LeaveWorld() {
+    SaveGame();
+    ResetSession();
+    delete gWorld;
+    gWorld = nullptr;
+    gWorldDir.clear();
+    gApp = App::Title;
+    SetCapture(false);
+}
+
+// ============================================================================
+// Menus: title screen, world list, create world, delete, pause
+//
+// Immediate mode: each frame the menu is drawn and its clickable widgets
+// are recorded; clicks are matched against last frame's widgets.
+// ============================================================================
+enum MenuId {
+    M_NONE, M_SINGLEPLAYER, M_QUIT, M_PLAY, M_GO_CREATE, M_DELETE, M_BACK, M_CREATE, M_MODE,
+    M_CONFIRM_DELETE, M_RESUME, M_QUIT_TO_TITLE, M_QUIT_GAME, M_FIELD_NAME, M_FIELD_SEED,
+    M_WORLD_ROW = 1000   // + index into gSaves
+};
+struct Widget { float x0, y0, x1, y1; int id; bool enabled; };
+static std::vector<Widget>   gWidgets;
+static std::vector<SaveInfo> gSaves;
+static int         gSelectedSave = -1, gSaveScroll = 0;
+static double      gLastRowClick = -1;
+static std::string gFieldName = "New World", gFieldSeed;
+static int         gFocusField = 0;               // 0 name, 1 seed
+static bool        gCreateCreative = false;
+static const int   VISIBLE_ROWS = 5;
+
+static const char* const SPLASHES[] = {
+    "NOW WITH FURNACES!", "PUNCH TREES!", "100% PROCEDURAL!", "MIND THE CACTUS!", "TORCHES SOLD SEPARATELY",
+    "THE DOT PRODUCT FROM DAY ONE!", "ALSO TRY MINECRAFT!", "DIG DOWN (CAREFULLY)", "BIOMES!", "SAVES NOW!",
+};
+static int gSplash = 0;
+
+static void RefreshSaves() {
+    gSaves = ListSaves(SAVES_ROOT);
+    if (gSelectedSave >= (int)gSaves.size()) gSelectedSave = -1;
+    gSaveScroll = std::max(0, std::min(gSaveScroll, (int)gSaves.size() - VISIBLE_ROWS));
+}
+
+static bool MouseIn(float x0, float y0, float x1, float y1) {
+    float mx, my;
+    MouseFb(mx, my);
+    return mx >= x0 && mx < x1 && my >= y0 && my < y1;
+}
+
+static void MenuBackground(Hud& hud) {
+    // Minecraft's classic menu backdrop: dark tiled dirt
+    const float S = GuiScale(), tile = 32 * S;
+    for (float y = 0; y < gFbH; y += tile)
+        for (float x = 0; x < gFbW; x += tile) {
+            const float q[4][2] = {{x, y + tile}, {x + tile, y + tile}, {x + tile, y}, {x, y}};
+            hud.TileQuad(q, T_DIRT, 0.25f);
+        }
+}
+
+static void CenteredText(Hud& hud, const char* text, float cy, float scale, Rgba color) {
+    hud.Text(text, std::floor(gFbW / 2.0f - Hud::TextWidth(text, scale) / 2), cy, scale, color, true);
+}
+
+// A Minecraft-style button, w x 20 GUI pixels, centered on cx
+static void Button(Hud& hud, float cx, float y, float w, const char* label, int id, bool enabled = true) {
+    const float S = GuiScale();
+    float x0 = std::floor(cx - w * S / 2), x1 = x0 + w * S, y1 = y + 20 * S;
+    bool hover = enabled && MouseIn(x0, y, x1, y1);
+    gWidgets.push_back({x0, y, x1, y1, id, enabled});
+    hud.Rect(x0, y, x1, y1, 0, 0, 0, 1);
+    Rgba fill = !enabled ? Rgba{0.2f, 0.2f, 0.2f, 1} : hover ? Rgba{0.42f, 0.47f, 0.68f, 1} : Rgba{0.44f, 0.44f, 0.44f, 1};
+    hud.Rect(x0 + S, y + S, x1 - S, y1 - S, fill.r, fill.g, fill.b, 1);
+    hud.Rect(x0 + S, y + S, x1 - S, y + 2 * S, fill.r * 1.35f, fill.g * 1.35f, fill.b * 1.35f, 1);   // lit top edge
+    hud.Rect(x0 + S, y1 - 3 * S, x1 - S, y1 - S, fill.r * 0.7f, fill.g * 0.7f, fill.b * 0.7f, 1);    // shaded bottom
+    if (hover) hud.Frame(x0, y, x1, y1, S, 1, 1, 1, 1);
+    Rgba ink = !enabled ? Rgba{0.63f, 0.63f, 0.63f, 1} : hover ? Rgba{1, 1, 0.63f, 1} : Rgba{0.88f, 0.88f, 0.88f, 1};
+    hud.Text(label, std::floor(cx - Hud::TextWidth(label, S) / 2), y + 8 * S, S, ink, true);
+}
+
+static void TextField(Hud& hud, float cx, float y, float w, const std::string& text, bool focused, int id) {
+    const float S = GuiScale();
+    float x0 = std::floor(cx - w * S / 2), x1 = x0 + w * S, y1 = y + 20 * S;
+    gWidgets.push_back({x0, y, x1, y1, id, true});
+    hud.Rect(x0, y, x1, y1, focused ? 1.0f : 0.63f, focused ? 1.0f : 0.63f, focused ? 1.0f : 0.63f, 1);
+    hud.Rect(x0 + S, y + S, x1 - S, y1 - S, 0, 0, 0, 1);
+    std::string shown = text;
+    if (focused && std::fmod(glfwGetTime(), 1.0) < 0.5) shown += "_";   // blinking caret
+    hud.Text(shown.c_str(), x0 + 4 * S, y + 8 * S, S, {0.88f, 0.88f, 0.88f, 1}, true);
+}
+
+static std::string DateText(long long t) {
+    if (t <= 0) return "NEVER PLAYED";
+    std::time_t tt = (std::time_t)t;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", &tm);
+    return buf;
+}
+
+static void BuildMenu(Hud& hud) {
+    gWidgets.clear();
+    const float S = GuiScale(), cx = gFbW / 2.0f;
+    const Rgba white = {1, 1, 1, 1}, gray = {0.63f, 0.63f, 0.63f, 1}, red = {1, 0.4f, 0.4f, 1};
+    if (gApp == App::Playing) {   // pause menu over the frozen world
+        hud.Rect(0, 0, (float)gFbW, (float)gFbH, 0.06f, 0.06f, 0.08f, 0.6f);
+        float y = gFbH / 4.0f;
+        CenteredText(hud, "GAME MENU", y, S, white);
+        y += 24 * S;
+        Button(hud, cx, y, 200, "BACK TO GAME", M_RESUME);
+        Button(hud, cx, y + 24 * S, 200, "SAVE AND QUIT TO TITLE", M_QUIT_TO_TITLE);
+        Button(hud, cx, y + 48 * S, 200, "SAVE AND QUIT GAME", M_QUIT_GAME);
+        return;
+    }
+
+    MenuBackground(hud);
+    if (gApp == App::Title) {
+        float y = gFbH / 4.0f;
+        CenteredText(hud, "MYENGINE", y, 4 * S, white);
+        // Splash text: a yellow one-liner under the title, like Minecraft's, gently pulsing
+        float glow = 0.8f + 0.2f * (float)std::sin(glfwGetTime() * 6.0);
+        CenteredText(hud, SPLASHES[gSplash], y + 26 * S, 2 * S, {1, 1, 0.25f * glow, 1});
+        y = gFbH / 2.0f;
+        Button(hud, cx, y, 200, "SINGLEPLAYER", M_SINGLEPLAYER);
+        Button(hud, cx, y + 24 * S, 200, "QUIT GAME", M_QUIT);
+        hud.Text("MYENGINE - A VOXEL SANDBOX", 2 * S, gFbH - 8 * S, S, gray, true);
+    } else if (gApp == App::Worlds) {
+        CenteredText(hud, "SELECT WORLD", 12 * S, S, white);
+        const float rowW = 240 * S, rowH = 32 * S, x0 = std::floor(cx - rowW / 2);
+        float y = 28 * S;
+        if (gSaves.empty()) CenteredText(hud, "NO WORLDS YET. CREATE ONE!", y + 40 * S, S, gray);
+        for (int i = gSaveScroll; i < (int)gSaves.size() && i < gSaveScroll + VISIBLE_ROWS; ++i, y += rowH + 2 * S) {
+            const SaveInfo& w = gSaves[i];
+            gWidgets.push_back({x0, y, x0 + rowW, y + rowH, M_WORLD_ROW + i, true});
+            if (i == gSelectedSave) {
+                hud.Rect(x0, y, x0 + rowW, y + rowH, 0.5f, 0.5f, 0.5f, 1);
+                hud.Rect(x0 + S, y + S, x0 + rowW - S, y + rowH - S, 0, 0, 0, 1);
+            } else if (MouseIn(x0, y, x0 + rowW, y + rowH)) {
+                hud.Rect(x0, y, x0 + rowW, y + rowH, 1, 1, 1, 0.08f);
+            }
+            hud.Text(w.name.c_str(), x0 + 6 * S, y + 5 * S, S, white, true);
+            std::string folder = std::filesystem::path(w.dir).filename().string() + " (" + DateText(w.lastPlayed) + ")";
+            hud.Text(folder.c_str(), x0 + 6 * S, y + 14 * S, S, gray, false);
+            char line[96];
+            std::snprintf(line, sizeof line, "%s MODE, DAY %lld, SEED %u", w.creative ? "CREATIVE" : "SURVIVAL",
+                          w.dayTime / DAY_TICKS + 1, w.seed);
+            hud.Text(line, x0 + 6 * S, y + 23 * S, S, gray, false);
+        }
+        if ((int)gSaves.size() > VISIBLE_ROWS) {
+            char more[48];
+            std::snprintf(more, sizeof more, "SCROLL FOR MORE (%d WORLDS)", (int)gSaves.size());
+            CenteredText(hud, more, y, S, gray);
+        }
+        if (!gMenuMessage.empty()) CenteredText(hud, gMenuMessage.c_str(), gFbH - 62 * S, S, red);
+        bool sel = gSelectedSave >= 0;
+        float by = gFbH - 52 * S;
+        Button(hud, cx - 77 * S, by, 150, "PLAY SELECTED WORLD", M_PLAY, sel);
+        Button(hud, cx + 77 * S, by, 150, "CREATE NEW WORLD", M_GO_CREATE);
+        Button(hud, cx - 77 * S, by + 24 * S, 150, "DELETE", M_DELETE, sel);
+        Button(hud, cx + 77 * S, by + 24 * S, 150, "CANCEL", M_BACK);
+    } else if (gApp == App::Create) {
+        float y = 20 * S;
+        CenteredText(hud, "CREATE NEW WORLD", y, S, white);
+        y += 22 * S;
+        hud.Text("WORLD NAME", std::floor(cx - 100 * S), y, S, gray, true);
+        TextField(hud, cx, y + 9 * S, 200, gFieldName, gFocusField == 0, M_FIELD_NAME);
+        y += 38 * S;
+        hud.Text("SEED FOR THE WORLD GENERATOR (BLANK = RANDOM)", std::floor(cx - 100 * S), y, S, gray, true);
+        TextField(hud, cx, y + 9 * S, 200, gFieldSeed, gFocusField == 1, M_FIELD_SEED);
+        y += 40 * S;
+        Button(hud, cx, y, 200, gCreateCreative ? "GAME MODE: CREATIVE" : "GAME MODE: SURVIVAL", M_MODE);
+        hud.Text(gCreateCreative ? "FLY, BUILD FREELY, NO DAMAGE" : "GATHER, CRAFT, STAY ALIVE",
+                 std::floor(cx - Hud::TextWidth(gCreateCreative ? "FLY, BUILD FREELY, NO DAMAGE" : "GATHER, CRAFT, STAY ALIVE", S) / 2),
+                 y + 24 * S, S, gray, false);
+        float by = gFbH - 28 * S;
+        bool named = gFieldName.find_first_not_of(' ') != std::string::npos;
+        Button(hud, cx - 77 * S, by, 150, "CREATE NEW WORLD", M_CREATE, named);
+        Button(hud, cx + 77 * S, by, 150, "CANCEL", M_BACK);
+    } else if (gApp == App::ConfirmDelete && gSelectedSave >= 0) {
+        float y = gFbH / 3.0f;
+        CenteredText(hud, "ARE YOU SURE YOU WANT TO DELETE THIS WORLD?", y, S, white);
+        std::string line = "'" + gSaves[gSelectedSave].name + "' WILL BE LOST FOREVER! (A LONG TIME!)";
+        CenteredText(hud, line.c_str(), y + 14 * S, S, gray);
+        Button(hud, cx - 77 * S, y + 40 * S, 150, "DELETE", M_CONFIRM_DELETE);
+        Button(hud, cx + 77 * S, y + 40 * S, 150, "CANCEL", M_BACK);
+    }
+}
+
+static void StartCreate() {
+    gFieldName = "New World";
+    gFieldSeed.clear();
+    gFocusField = 0;
+    gCreateCreative = false;
+    gApp = App::Create;
+}
+
+static void MenuAction(int id) {
+    if (id >= M_WORLD_ROW) {
+        int i = id - M_WORLD_ROW;
+        double now = glfwGetTime();
+        bool twice = i == gSelectedSave && now - gLastRowClick < 0.4;   // double click plays
+        gSelectedSave = i;
+        gLastRowClick = now;
+        if (twice) OpenWorld(gSaves[i]);
+        return;
+    }
+    switch (id) {
+        case M_SINGLEPLAYER: gMenuMessage.clear(); RefreshSaves(); gApp = App::Worlds; break;
+        case M_QUIT:         glfwSetWindowShouldClose(gWindow, GLFW_TRUE); break;
+        case M_PLAY:         if (gSelectedSave >= 0) OpenWorld(gSaves[gSelectedSave]); break;
+        case M_GO_CREATE:    StartCreate(); break;
+        case M_DELETE:       if (gSelectedSave >= 0) gApp = App::ConfirmDelete; break;
+        case M_CONFIRM_DELETE: {
+            std::error_code ec;
+            std::filesystem::remove_all(gSaves[gSelectedSave].dir, ec);
+            gSelectedSave = -1;
+            RefreshSaves();
+            gApp = App::Worlds;
+            break;
+        }
+        case M_BACK:
+            gApp = (gApp == App::Worlds) ? App::Title : App::Worlds;
+            if (gApp == App::Worlds) RefreshSaves();
+            break;
+        case M_MODE:        gCreateCreative = !gCreateCreative; break;
+        case M_FIELD_NAME:  gFocusField = 0; break;
+        case M_FIELD_SEED:  gFocusField = 1; break;
+        case M_CREATE: {
+            uint32_t seed;
+            if (!SeedFromText(gFieldSeed, seed))
+                seed = (uint32_t)(std::random_device{}() ^ (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count());
+            std::string name = gFieldName;
+            while (!name.empty() && name.back() == ' ') name.pop_back();
+            CreateNewWorld(name, seed, gCreateCreative);
+            break;
+        }
+        case M_RESUME:        Resume(); break;
+        case M_QUIT_TO_TITLE: LeaveWorld(); gSplash = (int)(Rand01() * (sizeof SPLASHES / sizeof SPLASHES[0])); break;
+        case M_QUIT_GAME:     glfwSetWindowShouldClose(gWindow, GLFW_TRUE); break;   // saves on the way out
+        default: break;
+    }
+}
+
+static void MenuClick() {
+    float mx, my;
+    MouseFb(mx, my);
+    std::vector<Widget> widgets = gWidgets;   // an action may rebuild the menu
+    for (const Widget& w : widgets)
+        if (w.enabled && mx >= w.x0 && mx < w.x1 && my >= w.y0 && my < w.y1) { MenuAction(w.id); return; }
+}
+
+static void MenuKey(int key) {
+    if (key == GLFW_KEY_ESCAPE) {
+        if (gApp == App::Worlds) gApp = App::Title;
+        else if (gApp == App::Create || gApp == App::ConfirmDelete) { gApp = App::Worlds; RefreshSaves(); }
+        return;
+    }
+    if (gApp == App::Create) {
+        std::string& f = gFocusField == 0 ? gFieldName : gFieldSeed;
+        if (key == GLFW_KEY_BACKSPACE && !f.empty()) f.pop_back();
+        if (key == GLFW_KEY_TAB) gFocusField = 1 - gFocusField;
+        if ((key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) && gFieldName.find_first_not_of(' ') != std::string::npos)
+            MenuAction(M_CREATE);
+    } else if (gApp == App::Worlds) {
+        if ((key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) && gSelectedSave >= 0) OpenWorld(gSaves[gSelectedSave]);
+        if (key == GLFW_KEY_DOWN && !gSaves.empty()) gSelectedSave = std::min((int)gSaves.size() - 1, gSelectedSave + 1);
+        if (key == GLFW_KEY_UP && !gSaves.empty()) gSelectedSave = std::max(0, gSelectedSave - 1);
+        if (gSelectedSave >= 0) {   // keep the selection in view
+            if (gSelectedSave < gSaveScroll) gSaveScroll = gSelectedSave;
+            if (gSelectedSave >= gSaveScroll + VISIBLE_ROWS) gSaveScroll = gSelectedSave - VISIBLE_ROWS + 1;
+        }
+    }
+}
+
+static void OnChar(GLFWwindow*, unsigned int cp) {
+    if (gApp != App::Create || cp < 32 || cp > 126) return;
+    std::string& f = gFocusField == 0 ? gFieldName : gFieldSeed;
+    if (f.size() < (gFocusField == 0 ? 32u : 24u)) f += (char)cp;
+}
+
+// ============================================================================
 // GLFW callbacks
 // ============================================================================
 static void OnError(int, const char* d) { std::fprintf(stderr, "GLFW error: %s\n", d); }
@@ -1362,6 +1803,7 @@ static void OnError(int, const char* d) { std::fprintf(stderr, "GLFW error: %s\n
 static void OnFramebufferSize(GLFWwindow*, int w, int h) { gFbW = w; gFbH = h; }
 
 static void OnCursor(GLFWwindow*, double x, double y) {
+    if (gApp != App::Playing || gPaused) return;
     if (gScreen != Screen::None) { UiDragMove(); return; }
     if (!gCaptured) return;
     if (gFirstMouse) { gLastMouseX = x; gLastMouseY = y; gFirstMouse = false; return; }
@@ -1374,6 +1816,11 @@ static void OnCursor(GLFWwindow*, double x, double y) {
 }
 
 static void OnScroll(GLFWwindow*, double, double yoff) {
+    if (gApp == App::Worlds) {
+        gSaveScroll = std::max(0, std::min(gSaveScroll - (int)yoff, (int)gSaves.size() - VISIBLE_ROWS));
+        return;
+    }
+    if (gApp != App::Playing || gPaused) return;
     if (yoff > 0) gSelected = (gSelected + 8) % 9;
     else if (yoff < 0) gSelected = (gSelected + 1) % 9;
 }
@@ -1381,6 +1828,7 @@ static void OnScroll(GLFWwindow*, double, double yoff) {
 static void OnMouseButton(GLFWwindow*, int button, int action, int mods) {
     if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_RIGHT) gRightDrag = false;
     if (action != GLFW_PRESS) return;
+    if (gApp != App::Playing || gPaused) { if (button == GLFW_MOUSE_BUTTON_LEFT) MenuClick(); return; }
     if (gScreen != Screen::None) { UiMouseButton(button, (mods & GLFW_MOD_SHIFT) != 0); return; }
     if (!gCaptured) { if (button == GLFW_MOUSE_BUTTON_LEFT) SetCapture(true); return; }
     if (button == GLFW_MOUSE_BUTTON_LEFT)   gLmbLatch = true;
@@ -1388,7 +1836,9 @@ static void OnMouseButton(GLFWwindow*, int button, int action, int mods) {
     if (button == GLFW_MOUSE_BUTTON_MIDDLE) gMmbLatch = true;
 }
 
-static void OnKey(GLFWwindow* w, int key, int, int action, int mods) {
+static void OnKey(GLFWwindow*, int key, int, int action, int mods) {
+    if (gApp != App::Playing) { if (action != GLFW_RELEASE) MenuKey(key); return; }
+    if (gPaused) { if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE) Resume(); return; }
     if (key == GLFW_KEY_Q && gCaptured && action != GLFW_RELEASE) {   // holding Q keeps dropping
         gDropLatch = true;
         gDropStack = (mods & GLFW_MOD_CONTROL) != 0;
@@ -1400,10 +1850,7 @@ static void OnKey(GLFWwindow* w, int key, int, int action, int mods) {
         else if (key == GLFW_KEY_F6) LoadRecipes();
         return;
     }
-    if (key == GLFW_KEY_ESCAPE) {
-        if (gCaptured) SetCapture(false);
-        else glfwSetWindowShouldClose(w, GLFW_TRUE);
-    }
+    if (key == GLFW_KEY_ESCAPE) { Pause(); return; }
     if (key == GLFW_KEY_E && gCaptured && gDeadTicks == 0) OpenScreen(Screen::Inventory);
     if (key == GLFW_KEY_F6) LoadRecipes();
     if (key == GLFW_KEY_F7) gDayTime += 3000;
@@ -1418,7 +1865,12 @@ static void OnKey(GLFWwindow* w, int key, int, int action, int mods) {
     }
 }
 
-static void OnFocus(GLFWwindow*, int focused) { if (!focused && gCaptured) SetCapture(false); }
+// Switching to another window pauses the game, like Minecraft
+static void OnFocus(GLFWwindow*, int focused) {
+    if (focused) return;
+    if (gApp == App::Playing && gScreen == Screen::None) Pause();
+    else if (gCaptured) SetCapture(false);
+}
 
 // ============================================================================
 // Game tick (20 per second)
@@ -1635,6 +2087,11 @@ static void GameTick() {
     } else {
         gLmbLatch = gRmbLatch = gMmbLatch = gDropLatch = false;
     }
+
+    if (++gAutosave >= AUTOSAVE_TICKS) {   // every 5 minutes
+        gAutosave = 0;
+        SaveGame();
+    }
 }
 
 // ============================================================================
@@ -1725,7 +2182,7 @@ static void DrawScreen(Hud& hud) {
         const Stack& st = *slots[hover].s;
         char text[64];
         int max = MaxDurability(st.item);
-        if (max > 0) std::snprintf(text, sizeof text, "%s  %d %d", ItemName(st.item), max - st.damage, max);
+        if (max > 0) std::snprintf(text, sizeof text, "%s  %d/%d", ItemName(st.item), max - st.damage, max);
         else         std::snprintf(text, sizeof text, "%s", ItemName(st.item));
         float tw = Hud::TextWidth(text, S);
         float tx = mx + 12 * S, ty = my - 12 * S;
@@ -1740,9 +2197,6 @@ static void DrawScreen(Hud& hud) {
 // Main
 // ============================================================================
 int main(int argc, char** argv) {
-    // A fresh world every launch, unless a seed is given on the command line
-    uint32_t seed = argc > 1 ? (uint32_t)std::strtoul(argv[1], nullptr, 10)
-                             : (uint32_t)(std::random_device{}() ^ (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count());
 
     glfwSetErrorCallback(OnError);
     if (!glfwInit()) return -1;
@@ -1751,7 +2205,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_SAMPLES, 4);
 
-    gWindow = glfwCreateWindow(1280, 720, "MyEngine | Generating world...", nullptr, nullptr);
+    gWindow = glfwCreateWindow(1280, 720, "MyEngine", nullptr, nullptr);
     if (!gWindow) { glfwTerminate(); return -1; }
     glfwMakeContextCurrent(gWindow);
     glfwSwapInterval(1);
@@ -1763,25 +2217,17 @@ int main(int argc, char** argv) {
     glfwSetMouseButtonCallback(gWindow, OnMouseButton);
     glfwSetKeyCallback(gWindow, OnKey);
     glfwSetWindowFocusCallback(gWindow, OnFocus);
+    glfwSetCharCallback(gWindow, OnChar);
     glfwGetFramebufferSize(gWindow, &gFbW, &gFbH);
 
-    // Show a sky colored frame while the world generates
-    glClearColor(0.70f, 0.82f, 1.0f, 1.0f);
+    glClearColor(0.1f, 0.08f, 0.06f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glfwSwapBuffers(gWindow);
 
     std::printf("Controls: WASD move | Mouse look | Space jump | Shift sneak | Ctrl sprint\n"
                 "          LMB break | RMB place/eat | MMB pick | Q drop | 1-9/wheel hotbar | G game mode\n"
-                "          Double tap Space fly (creative) | F5 third person | F3 debug | Esc mouse\n"
+                "          Double tap Space fly (creative) | F5 third person | F3 debug | Esc pause\n"
                 "Survival: your hotbar starts empty, so go punch a tree. Press G for creative.\n");
-
-    // ---- World ----
-    double t0 = glfwGetTime();
-    gWorld = new World();
-    Generate(*gWorld, seed);
-    Spawn(*gWorld, gPlayer);
-    gPlayer.yaw = PI * 0.25f;
-    std::printf("World seed %u generated in %.2fs (run \"MyEngine.exe %u\" to play it again)\n", seed, glfwGetTime() - t0, seed);
 
     // ---- GPU resources ----
     GLuint blockProg  = CompileProgram("block", BLOCK_VS, BLOCK_FS);
@@ -1831,9 +2277,6 @@ int main(int argc, char** argv) {
             gChunks[cx][cz].solid.Init({3, 2, 3, 1, 2, 3});
             gChunks[cx][cz].water.Init({3, 2, 3, 1, 2, 3});
         }
-    t0 = glfwGetTime();
-    RebuildDirtyChunks(*gWorld);
-    std::printf("Meshed %d chunks in %.2fs\n", CHUNKS_X * CHUNKS_Z, glfwGetTime() - t0);
     LoadRecipes();
 
     DynMesh lines, overlay, clouds, hudMesh, crossMesh;
@@ -1849,7 +2292,7 @@ int main(int argc, char** argv) {
     const float CLOUD_PERIOD = CLOUD_N * CLOUD_CELL;
     {
         std::vector<float> cv;
-        Perlin cn(seed + 99);
+        Perlin cn(99);
         for (int i = 0; i < CLOUD_N; ++i)
             for (int j = 0; j < CLOUD_N; ++j) {
                 if (cn.Fbm(i * 0.16, j * 0.16, 2) < 0.12) continue;
@@ -1865,7 +2308,7 @@ int main(int argc, char** argv) {
     struct Star { Vec3 dir; float size, bright; };
     std::vector<Star> stars;
     {
-        std::mt19937 rng(seed + 7);
+        std::mt19937 rng(7);
         std::uniform_real_distribution<float> U(-1.0f, 1.0f);
         while (stars.size() < 1500) {
             Vec3 d = {U(rng), U(rng), U(rng)};
@@ -1881,7 +2324,33 @@ int main(int argc, char** argv) {
     glCullFace(GL_BACK);
     glEnable(GL_MULTISAMPLE);
 
-    SetCapture(true);
+    // Draws one frame with a message on the menu backdrop (while loading)
+    gShowMessage = [&](const char* text) {
+        glViewport(0, 0, gFbW, gFbH);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glUseProgram(hudProg);
+        Mat4 ortho = Ortho(0, (float)gFbW, (float)gFbH, 0);
+        glUniformMatrix4fv(hProj, 1, GL_FALSE, ortho.m);
+        glBindTexture(GL_TEXTURE_2D, atlasTex);
+        Hud hud;
+        MenuBackground(hud);
+        CenteredText(hud, text, gFbH / 2.0f, GuiScale(), {1, 1, 1, 1});
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        hudMesh.Draw(hud.v, GL_TRIANGLES);
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glfwSwapBuffers(gWindow);
+    };
+
+    gSplash = (int)(std::random_device{}() % (sizeof SPLASHES / sizeof SPLASHES[0]));
+    if (argc > 1) {   // straight into a fresh world with this seed
+        uint32_t seed = (uint32_t)std::strtoul(argv[1], nullptr, 10);
+        CreateNewWorld("Seed " + std::to_string(seed), seed, false);
+    }
 
     // ---- Fixed 20 TPS simulation, rendered as fast as vsync allows ----
     const double TICK = 1.0 / TPS;
@@ -1896,10 +2365,35 @@ int main(int argc, char** argv) {
         acc += frameDt;
 
         glfwPollEvents();
-        while (acc >= TICK) { GameTick(); acc -= TICK; }
-        RebuildDirtyChunks(*gWorld);
-
         if (gFbW == 0 || gFbH == 0) { glfwWaitEvents(); continue; }   // minimized
+
+        if (gApp != App::Playing) {
+            acc = 0;
+            glViewport(0, 0, gFbW, gFbH);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glUseProgram(hudProg);
+            Mat4 ortho = Ortho(0, (float)gFbW, (float)gFbH, 0);
+            glUniformMatrix4fv(hProj, 1, GL_FALSE, ortho.m);
+            glBindTexture(GL_TEXTURE_2D, atlasTex);
+            Hud hud;
+            BuildMenu(hud);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            hudMesh.Draw(hud.v, GL_TRIANGLES);
+            glDisable(GL_BLEND);
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+            glfwSetWindowTitle(gWindow, "MyEngine");
+            glfwSwapBuffers(gWindow);
+            continue;
+        }
+
+        if (gPaused) acc = 0;   // the world stands still while paused
+        while (acc >= TICK) { GameTick(); acc -= TICK; }
+        if (gApp != App::Playing) continue;   // a tick can't leave the world, but be safe
+        RebuildDirtyChunks(*gWorld);
         const float alpha = (float)(acc / TICK);
         const Player& p = gPlayer;
 
@@ -2179,7 +2673,7 @@ int main(int argc, char** argv) {
         const float S = (float)std::max(1, std::min(gFbH / 240, gFbW / 320));   // GUI scale
         Hud hud;
         if (underwater) hud.Rect(0, 0, (float)gFbW, (float)gFbH, 0.05f, 0.15f, 0.45f, 0.25f);
-        if (!gCaptured && gScreen == Screen::None) hud.Rect(0, 0, (float)gFbW, (float)gFbH, 0, 0, 0, 0.45f);
+        if (!gCaptured && gScreen == Screen::None && !gPaused) hud.Rect(0, 0, (float)gFbW, (float)gFbH, 0, 0, 0, 0.45f);
 
         // Hotbar: 182 x 22 GUI pixels, 9 slots 20 pixels apart
         float hx = std::floor((gFbW - 182 * S) / 2), hy = gFbH - 22 * S;
@@ -2265,6 +2759,8 @@ int main(int argc, char** argv) {
 
         if (gScreen != Screen::None) DrawScreen(hud);
         if (gDeadTicks > 0) hud.Rect(0, 0, (float)gFbW, (float)gFbH, 0.55f, 0.0f, 0.0f, 0.45f);
+        if (now - gSavedAt < 2.0) hud.Text("SAVED", gFbW - Hud::TextWidth("SAVED", S) - 4 * S, 4 * S, S, {1, 1, 1, 0.8f}, true);
+        if (gPaused) BuildMenu(hud);
 
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -2315,17 +2811,19 @@ int main(int argc, char** argv) {
                 const char* biomeName = BiomeData(gWorld->BiomeAt((int)std::floor(p.x), (int)std::floor(p.z))).name;
                 std::snprintf(buf, sizeof buf, "MyEngine | %d fps | Day %lld %02d:%02d | %s | XYZ %.2f / %.2f / %.2f | Facing %s | %.2f m/s%s | %s%s | Holding %s | Items %d%s | Seed %u",
                               fps, gDayTime / DAY_TICKS + 1, hour, minute, biomeName, p.x, p.y, p.z, facing, hs, state.c_str(), mode, stats, held,
-                              (int)gItems.size(), look, seed);
+                              (int)gItems.size(), look, gWorld->seed);
             } else {
                 std::snprintf(buf, sizeof buf, "MyEngine | %s | Holding %s", mode, held);
             }
             if (gDeadTicks > 0) std::snprintf(buf, sizeof buf, "MyEngine | You died! Respawning...");
-            glfwSetWindowTitle(gWindow, (gCaptured || gScreen != Screen::None) ? buf : "MyEngine | Paused (click to play, Esc to quit)");
+            if (gPaused) std::snprintf(buf, sizeof buf, "MyEngine | %s | Paused", gWorldName.c_str());
+            glfwSetWindowTitle(gWindow, buf);
         }
 
         glfwSwapBuffers(gWindow);
     }
 
+    if (gWorld) SaveGame();   // closing the window saves the world
     delete gWorld;
     glfwDestroyWindow(gWindow);
     glfwTerminate();
