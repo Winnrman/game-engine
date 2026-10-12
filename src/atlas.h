@@ -248,6 +248,76 @@ inline void PaintBiomeBlocks(Image& im) {
         }
 }
 
+// Grass, ferns and flowers: drawn on a transparent tile and shown as two
+// crossed quads. Grass and ferns are gray (tinted by biome like the grass
+// block); flowers keep their colors.
+inline void PaintPlants(Image& im) {
+    using namespace game;
+    // Short grass: thin blades fanning up from the bottom
+    for (int b = 0; b < 9; ++b) {
+        double baseX = 1.5 + b * 1.6 + (Rnd(70, b, 0) - 0.5) * 1.2;
+        double lean = (Rnd(70, b, 1) - 0.5) * 0.5, height = 7 + Rnd(70, b, 2) * 8;
+        for (int i = 0; i < (int)height; ++i) {
+            int x = (int)std::lround(baseX + lean * i), y = 15 - i;
+            if (x < 0 || x > 15 || y < 0) continue;
+            double v = 150 + 80 * Rnd(70, x, y, 3);
+            Put(im, T_SHORT_GRASS, x, y, {v, v, v});
+        }
+    }
+    // Fern: a few drooping fronds with leaflets
+    for (int f = 0; f < 4; ++f) {
+        double dir = (f - 1.5) * 0.55;
+        double fx = 7.5, fy = 15;
+        for (int i = 0; i < 12; ++i) {
+            fx += dir * (0.6 + i * 0.06);
+            fy -= 1.0 - i * 0.05;
+            int x = (int)std::lround(fx), y = (int)std::lround(fy);
+            if (x < 0 || x > 15 || y < 0 || y > 15) break;
+            double v = 140 + 70 * Rnd(71, x, y);
+            Put(im, T_FERN, x, y, {v, v, v});
+            if (i % 2 == 0) {   // leaflets either side
+                if (y - 1 >= 0) Put(im, T_FERN, x, y - 1, {v * 0.9, v * 0.9, v * 0.9});
+                int sx = x + (dir > 0 ? -1 : 1);
+                if (sx >= 0 && sx <= 15) Put(im, T_FERN, sx, y, {v * 0.85, v * 0.85, v * 0.85});
+            }
+        }
+    }
+    // Dead bush: brown twigs branching up and out
+    for (int t = 0; t < 7; ++t) {
+        double dir = (t - 3) * 0.35, x = 7.5, y = 15;
+        for (int i = 0; i < 10; ++i) {
+            x += dir * (0.5 + 0.1 * i) + (Rnd(72, t, i) - 0.5) * 0.6;
+            y -= 1;
+            int px = (int)std::lround(x), py = (int)std::lround(y);
+            if (px < 0 || px > 15 || py < 0) break;
+            Put(im, T_DEAD_BUSH, px, py, Mul({120, 82, 40}, 0.8 + 0.3 * Rnd(72, px, py, 1)));
+        }
+    }
+    // Flowers: a green stem with leaves and a colored head
+    struct Flower { int tile; Col petal, center; int headY, size; };
+    const Flower flowers[] = {
+        {T_DANDELION,   {250, 220, 40},  {255, 240, 120}, 6, 2},
+        {T_POPPY,       {220, 30, 30},   {40, 20, 20},    5, 2},
+        {T_CORNFLOWER,  {70, 110, 230},  {40, 60, 160},   5, 2},
+        {T_OXEYE_DAISY, {245, 245, 240}, {240, 200, 40},  5, 2},
+        {T_AZURE_BLUET, {230, 235, 250}, {240, 220, 120}, 8, 1},
+        {T_ALLIUM,      {190, 110, 230}, {150, 80, 200},  4, 3},
+        {T_BLUE_ORCHID, {60, 170, 230},  {30, 110, 190},  6, 2},
+    };
+    for (const Flower& f : flowers) {
+        for (int y = f.headY + f.size; y <= 15; ++y)
+            Put(im, f.tile, 8, y, Mul({60, 130, 40}, 0.85 + 0.25 * Rnd(f.tile, 8, y)));       // stem
+        Put(im, f.tile, 7, 12, {70, 150, 45}); Put(im, f.tile, 9, 10, {70, 150, 45});           // leaves
+        Put(im, f.tile, 6, 11, {60, 135, 40}); Put(im, f.tile, 10, 9, {60, 135, 40});
+        for (int dy = -f.size; dy <= f.size; ++dy)
+            for (int dx = -f.size; dx <= f.size; ++dx) {
+                if (std::abs(dx) + std::abs(dy) > f.size + 1) continue;
+                Col c = (dx == 0 && dy == 0) ? f.center : Mul(f.petal, 0.85 + 0.25 * Rnd(f.tile, dx, dy, 1));
+                Put(im, f.tile, 8 + dx, f.headY + dy, c);
+            }
+    }
+}
+
 inline Image Build() {
     using namespace game;
     Image im;
@@ -485,6 +555,7 @@ inline Image Build() {
 
     PaintCraftingTable(im);
     PaintBiomeBlocks(im);
+    PaintPlants(im);
 
     // Torch: a 2px stick (columns 7-8, rows 8-15) with a 2px flame on top
     // (rows 6-7). The 3D torch model samples exactly this 2x10 strip.

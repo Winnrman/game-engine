@@ -9,6 +9,22 @@
 
 using namespace game;
 
+// The tests build their worlds over this area (the game's world is endless)
+constexpr int WX = 256, WZ = 256;
+
+// Every block (or light value) in the test area, in a fixed order
+static std::vector<uint8_t> Snapshot(const World& w, bool light, int x0 = 0, int z0 = 0, int x1 = WX - 1, int z1 = WZ - 1) {
+    std::vector<uint8_t> out;
+    out.reserve((size_t)(x1 - x0 + 1) * (z1 - z0 + 1) * WY);
+    for (int x = x0; x <= x1; ++x)
+        for (int z = z0; z <= z1; ++z)
+            for (int y = 0; y < WY; ++y)
+                out.push_back(light ? (uint8_t)(w.SkyLight(x, y, z) << 4 | w.BlockLight(x, y, z)) : w.Get(x, y, z));
+    return out;
+}
+
+static void GenerateTestWorld(World& w, uint32_t seed) { GenerateArea(w, seed, 0, 0, WX - 1, WZ - 1); }
+
 static void FlatWorld(World& w) {
     for (int x = 0; x < WX; ++x)
         for (int z = 0; z < WZ; ++z) {
@@ -355,10 +371,11 @@ int main() {
         check("wall torch lights the room", lw.BlockLight(107, 42, 104), 13, 0);
 
         // ...and after all that, local updates must match a full relight
-        std::vector<uint8_t> incremental = lw.light;
+        std::vector<uint8_t> incremental = Snapshot(lw, true);
         RelightAll(lw);
+        std::vector<uint8_t> full = Snapshot(lw, true);
         size_t diff = 0;
-        for (size_t i = 0; i < incremental.size(); ++i) diff += incremental[i] != lw.light[i];
+        for (size_t i = 0; i < incremental.size(); ++i) diff += incremental[i] != full[i];
         check("local relight == full relight", (double)diff, 0, 0);
 
         // Leaves and water dim light but don't block it
@@ -396,7 +413,7 @@ int main() {
 
     // ---- World generation: ores and caves ----
     {
-        World g1; Generate(g1, 1337);
+        World g1; GenerateTestWorld(g1, 1337);
         long count[BLOCK_COUNT] = {};
         int lo[BLOCK_COUNT], hi[BLOCK_COUNT];
         for (int i = 0; i < BLOCK_COUNT; ++i) { lo[i] = WY; hi[i] = -1; }
@@ -424,9 +441,9 @@ int main() {
         check("water hanging over a cave", (double)hangingWater, 0, 0);
 
         // Same seed, same world; different seed, different world
-        World g2; Generate(g2, 1337);
-        World g3; Generate(g3, 1338);
-        ok = g1.blocks == g2.blocks && g1.blocks != g3.blocks;
+        World g2; GenerateTestWorld(g2, 1337);
+        World g3; GenerateTestWorld(g3, 1338);
+        ok = Snapshot(g1, false) == Snapshot(g2, false) && Snapshot(g1, false) != Snapshot(g3, false);
         std::printf("%-28s %9s  %s\n", "seeds are repeatable", ok ? "yes" : "no", ok ? "OK" : "FAIL");
         if (!ok) ++fails;
 
@@ -541,7 +558,7 @@ int main() {
         long cactusBad = 0, snowBad = 0, snowInDesert = 0, cactus = 0, ice = 0, spruce = 0, birch = 0;
         for (uint32_t seed : {1337u, 4242u, 99u}) {
             World g;
-            Generate(g, seed);
+            GenerateTestWorld(g, seed);
             for (int x = 0; x < WX; ++x)
                 for (int z = 0; z < WZ; ++z) {
                     uint8_t biome = g.BiomeAt(x, z);
@@ -567,7 +584,7 @@ int main() {
         check("snow in the desert", (double)snowInDesert, 0, 0);
 
         // Grass color blends: a column deep in a biome has its exact color
-        World g; Generate(g, 1337);
+        World g; GenerateTestWorld(g, 1337);
         bool exact = false;
         for (int x = 8; x < WX - 8 && !exact; ++x)
             for (int z = 8; z < WZ - 8 && !exact; ++z) {
@@ -621,13 +638,15 @@ int main() {
         const std::string root = (fs::temp_directory_path() / "myengine_save_test").generic_string();
         fs::remove_all(root);
 
-        World a; Generate(a, 1337);
-        a.Set(100, 70, 100, FURNACE_PX);
-        a.Set(101, 70, 100, TORCH);
+        World a; GenerateArea(a, 1337, 0, 0, 63, 63);
+        a.Set(10, 70, 10, FURNACE_PX);
+        a.Set(11, 70, 10, TORCH);
+        a.Set(-3, 70, -3, BRICKS);   // a chunk at negative coordinates
         SaveData d;
         d.name = "Test World";
         d.dayTime = 31337;
         d.lastPlayed = 1700000000;
+        d.spawnX = -42; d.spawnZ = 17;
         d.player.x = 101.25; d.player.y = 70; d.player.z = 99.5;
         d.player.yaw = 1.5f; d.player.pitch = -0.25f;
         d.player.health = 13.5; d.player.food = 9; d.player.saturation = 1.25; d.player.air = 120;
@@ -639,28 +658,43 @@ int main() {
         d.selected = 5;
         SpawnItem(d.items, 50.5, 70, 50.5, 0.1, 0, 0, {DIAMOND, 3}, 10);
         FurnaceState f; f.input = {IRON_ORE, 4}; f.fuel = {COAL, 2}; f.output = {IRON_INGOT, 1}; f.litTime = 900; f.litDuration = 1600; f.cookTime = 77;
-        d.furnaces[12345] = f;
+        d.furnaces[BlockKey(-1000, 70, 2000)] = f;
 
         const std::string dir = NewWorldDir(root, "Test World");
         std::string err;
         bool saved = SaveWorld(dir, a, d, err);
-        size_t bytes = saved ? (size_t)fs::file_size(dir + "/world.dat") : 0;
-        std::printf("%-28s %9zu bytes  %s\n", "save world", bytes, saved ? "OK" : ("FAIL " + err).c_str());
+        size_t files = 0, bytes = 0;
+        for (const auto& e : fs::recursive_directory_iterator(dir)) if (e.is_regular_file()) { ++files; bytes += (size_t)e.file_size(); }
+        std::printf("%-28s %4zu files %7zu KB  %s\n", "save world", files, bytes / 1024, saved ? "OK" : ("FAIL " + err).c_str());
         if (!saved) ++fails;
 
+        // world.dat, then the chunks one by one, like the game streams them
         World b;
         SaveData e;
         bool loaded = LoadWorld(dir, b, e, err);
-        RelightAll(a);   // what the original's light should be after those edits
-        bool ok = loaded && b.blocks == a.blocks && b.light == a.light && b.biome == a.biome && b.grassColor == a.grassColor &&
-                  b.seed == 1337 && e.name == "Test World" && e.dayTime == 31337 &&
+        for (const auto& kv : a.chunks) loaded = loaded && LoadChunk(dir, b, kv.second->cx, kv.second->cz);
+        for (auto& kv : b.chunks) kv.second->lit = false;
+        RelightAll(a);
+        RelightAll(b);
+        bool ok = loaded && Snapshot(b, false, -16, -16, 63, 63) == Snapshot(a, false, -16, -16, 63, 63) &&
+                  Snapshot(b, true, 0, 0, 63, 63) == Snapshot(a, true, 0, 0, 63, 63) &&
+                  b.GrassAt(30, 30) == a.GrassAt(30, 30) && b.BiomeAt(-3, -3) == a.BiomeAt(-3, -3) && b.Get(-3, 70, -3) == BRICKS &&
+                  b.seed == 1337 && e.name == "Test World" && e.dayTime == 31337 && e.spawnX == -42 && e.spawnZ == 17 &&
                   e.player.x == 101.25 && e.player.yaw == 1.5f && e.player.health == 13.5 && e.player.food == 9 &&
                   e.player.air == 120 && e.player.creative && e.player.flying &&
                   e.inv.slots[0].item == LOG && e.inv.slots[0].count == 20 && e.inv.slots[5].damage == 37 &&
                   e.creativeBar[0] == SPRUCE_LOG && e.selected == 5 &&
                   e.items.size() == 1 && e.items[0].stack.item == DIAMOND && e.items[0].stack.count == 3 &&
-                  e.furnaces.count(12345) && e.furnaces[12345].cookTime == 77 && e.furnaces[12345].output.item == IRON_INGOT;
+                  e.furnaces.count(BlockKey(-1000, 70, 2000)) && e.furnaces[BlockKey(-1000, 70, 2000)].cookTime == 77;
         std::printf("%-28s %9s  %s\n", "load: everything matches", ok ? "yes" : ("no " + err).c_str(), ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+        ok = !LoadChunk(dir, b, 500, 500);   // never generated: no file
+        // Saving again only rewrites chunks that changed
+        a.Set(12, 70, 12, GLASS);
+        size_t dirty = 0;
+        for (auto& kv : a.chunks) dirty += kv.second->modified;
+        ok = ok && SaveWorld(dir, a, d, err) && dirty == 1;
+        std::printf("%-28s %9zu  %s\n", "only changed chunks resaved", dirty, ok ? "OK" : "FAIL");
         if (!ok) ++fails;
 
         SaveInfo info;
@@ -672,6 +706,9 @@ int main() {
         if (!ok) ++fails;
 
         // A damaged save is refused with a reason instead of crashing
+        std::string chunkProblem;
+        { std::ofstream t(ChunkPath(dir, 0, 0), std::ios::binary); t << "garbage"; }
+        bool chunkRefused = !LoadChunk(dir, b, 0, 0, &chunkProblem) && !chunkProblem.empty();
         std::vector<uint8_t> raw;
         ReadFile(dir + "/world.dat", raw);
         { std::ofstream t(dir + "/world.dat", std::ios::binary); t.write((const char*)raw.data(), (std::streamsize)raw.size() / 2); }
@@ -680,7 +717,7 @@ int main() {
         bool refused = !LoadWorld(dir, c, g, why) && !why.empty();
         { std::ofstream t(dir + "/world.dat", std::ios::binary); t << "not a world at all"; }
         std::string why2;
-        refused = refused && !LoadWorld(dir, c, g, why2) && why2 == "not a MyEngine world";
+        refused = refused && !LoadWorld(dir, c, g, why2) && why2 == "not a MyEngine world" && chunkRefused;
         std::printf("%-28s %9s  %s\n", "damaged save refused", refused ? "yes" : "no", refused ? "OK" : "FAIL");
         if (!refused) ++fails;
         fs::remove_all(root);
@@ -692,9 +729,95 @@ int main() {
         if (!ok) ++fails;
     }
 
+    // ---- Endless world ----
+    {
+        // Negative coordinates work like any others
+        World n;
+        n.SetRaw(-5, 70, -20, BRICKS);
+        int bx, by, bz;
+        UnpackBlockKey(BlockKey(-123456, 99, 654321), bx, by, bz);
+        bool ok = n.Get(-5, 70, -20) == BRICKS && n.Get(-5, 70, -21) == AIR && n.GetChunk(-1, -2) &&
+                  ChunkCoord(-1) == -1 && ChunkCoord(-16) == -1 && ChunkCoord(-17) == -2 && ChunkCoord(15) == 0 &&
+                  bx == -123456 && by == 99 && bz == 654321;
+        std::printf("%-28s %9s  %s\n", "negative coordinates", ok ? "work" : "broken", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        // A chunk's terrain (caves included) is the same whatever order chunks
+        // are made in, so there are no seams
+        World one, many;
+        one.seed = many.seed = 4242;
+        GenerateTerrain(one, one.EnsureChunk(7, -3));
+        for (int cx = 9; cx >= 5; --cx)
+            for (int cz = -1; cz >= -5; --cz) GenerateTerrain(many, many.EnsureChunk(cx, cz));
+        ok = std::memcmp(one.GetChunk(7, -3)->blocks, many.GetChunk(7, -3)->blocks, sizeof(Chunk::blocks)) == 0;
+        std::printf("%-28s %9s  %s\n", "terrain order-independent", ok ? "yes" : "no", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        // Caves cross chunk borders: count cave air touching the border on both sides
+        World g; GenerateArea(g, 1337, 0, 0, 255, 255);
+        long joined = 0;
+        for (int b = 16; b < 256; b += 16)
+            for (int z = 0; z < 256; ++z)
+                for (int y = 5; y < 55; ++y)
+                    joined += g.Get(b - 1, y, z) == AIR && g.Get(b, y, z) == AIR;
+        std::printf("%-28s %9ld cells\n", "cave air across borders", joined);
+        ok = joined > 500;
+        std::printf("%-28s %9s  %s\n", "caves cross chunk borders", ok ? "yes" : "no", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        // Far from the origin the generator still makes land, sea and caves
+        World far; GenerateArea(far, 1337, 100000, -50000, 100063, -49937);
+        long air = 0, solid = 0;
+        for (int x = 100000; x < 100064; ++x)
+            for (int z = -50000; z < -49936; ++z)
+                for (int y = 1; y < 60; ++y) (far.Get(x, y, z) == AIR ? air : solid)++;
+        ok = solid > 100000 && air > 0;
+        std::printf("%-28s %9s  %s\n", "terrain at x=100000", ok ? "fine" : "broken", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+
+        int sx, sz;
+        FindSpawnColumn(1337, sx, sz);
+        World sw; GenerateArea(sw, 1337, sx - 32, sz - 32, sx + 32, sz + 32);
+        Player sp;
+        ok = SpawnNear(sw, sp, sx, sz);
+        uint8_t under = sw.Get((int)std::floor(sp.x), (int)sp.y - 1, (int)std::floor(sp.z));
+        std::printf("spawn at %.1f %.1f %.1f on %s  %s\n", sp.x, sp.y, sp.z, Info(under).name, ok ? "OK" : "FAIL");
+        if (!ok || (under != GRASS && under != SAND)) ++fails;
+    }
+
+    // ---- Plants ----
+    {
+        World g; GenerateTestWorld(g, 1337);
+        long plants = 0, flowers = 0, badPlant = 0, deadBush = 0;
+        for (int x = 0; x < WX; ++x)
+            for (int z = 0; z < WZ; ++z)
+                for (int y = 1; y < WY; ++y) {
+                    uint8_t b = g.Get(x, y, z);
+                    if (!IsPlant(b)) continue;
+                    ++plants;
+                    flowers += IsFlower(b);
+                    deadBush += b == DEAD_BUSH;
+                    if (!CanSurvive(g, b, x, y, z)) ++badPlant;
+                }
+        std::printf("%-28s %9ld (%ld flowers)\n", "plants generated", plants, flowers);
+        bool ok = plants > 1000 && flowers > 20 && badPlant == 0;
+        std::printf("%-28s %9s  %s\n", "plants on soil", ok ? "yes" : "no", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+        ok = BlockDrop(POPPY).item == POPPY && BlockDrop(SHORT_GRASS).count == 0 && BreakTicks(DANDELION) == 0 &&
+             IsReplaceable(SHORT_GRASS) && !IsReplaceable(POPPY) && !Info(FERN).solid;
+        int sticks = 0;
+        for (int i = 0; i < 300; ++i) { Stack st = BlockDrop(DEAD_BUSH); if (st.count) { ok = ok && st.item == STICK && st.count <= 2; sticks += st.count; } }
+        ok = ok && sticks > 200 && sticks < 400;   // 0-2 sticks each, 1 on average
+        std::printf("%-28s %9s  %s\n", "plant rules", ok ? "as wiki" : "wrong", ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+    }
+
     // Real terrain generation sanity
-    World g; Generate(g, 1337);
-    Player sp; Spawn(g, sp);
+    World g; GenerateTestWorld(g, 1337);
+    Player sp;
+    int spx, spz;
+    FindSpawnColumn(1337, spx, spz);
+    SpawnNear(g, sp, spx, spz);
     std::printf("spawn at %.1f %.1f %.1f, block below: %s\n", sp.x, sp.y, sp.z,
                 Info(g.Get((int)sp.x, (int)sp.y - 1, (int)sp.z)).name);
     RayHit h = Raycast(g, sp.x, sp.y + EYE_HEIGHT, sp.z, 0, -1, 0, 4.5);

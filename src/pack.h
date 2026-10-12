@@ -47,6 +47,12 @@ inline const std::vector<Entry>& Entries() {
         {T_BIRCH_PLANKS, "block/birch_planks", NORMAL},       {T_CACTUS_SIDE, "block/cactus_side", NORMAL},
         {T_CACTUS_TOP, "block/cactus_top", NORMAL},           {T_CACTUS_BOTTOM, "block/cactus_bottom", NORMAL},
         {T_SNOW, "block/snow", NORMAL},                       {T_ICE, "block/ice", NORMAL},
+        {T_SHORT_GRASS, "block/grass", NORMAL},               {T_SHORT_GRASS, "block/short_grass", NORMAL},   // renamed in 1.20.3
+        {T_FERN, "block/fern", NORMAL},                       {T_DEAD_BUSH, "block/dead_bush", NORMAL},
+        {T_DANDELION, "block/dandelion", NORMAL},             {T_POPPY, "block/poppy", NORMAL},
+        {T_CORNFLOWER, "block/cornflower", NORMAL},           {T_OXEYE_DAISY, "block/oxeye_daisy", NORMAL},
+        {T_AZURE_BLUET, "block/azure_bluet", NORMAL},         {T_ALLIUM, "block/allium", NORMAL},
+        {T_BLUE_ORCHID, "block/blue_orchid", NORMAL},
         {T_APPLE, "item/apple", NORMAL},                      {T_STICK, "item/stick", NORMAL},
         {T_COAL_ITEM, "item/coal", NORMAL},                   {T_DIAMOND, "item/diamond", NORMAL},
         {T_EMERALD, "item/emerald", NORMAL},                  {T_IRON_INGOT, "item/iron_ingot", NORMAL},

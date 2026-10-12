@@ -50,6 +50,8 @@
 #include <cstring>
 #include <random>
 #include <map>
+#include <unordered_map>
+#include <memory>
 #include <ctime>
 #include <functional>
 #include <chrono>
@@ -289,6 +291,12 @@ struct DynMesh {
         glDrawArrays(mode, 0, uploaded);
     }
     void Draw(const std::vector<float>& v, GLenum mode) { Upload(v); DrawUploaded(mode); }
+    void Free() {
+        if (vbo) glDeleteBuffers(1, &vbo);
+        if (vao) glDeleteVertexArrays(1, &vao);
+        vao = vbo = 0;
+        uploaded = 0;
+    }
 };
 
 // ============================================================================
@@ -314,10 +322,13 @@ static const float AO_LEVELS[4] = {0.42f, 0.62f, 0.81f, 1.0f};   // vertex: pos3
 struct ChunkMesh {
     DynMesh solid, water;
     bool dirty = true;
+    ChunkMesh() { solid.Init({3, 2, 3, 1, 2, 3}); water.Init({3, 2, 3, 1, 2, 3}); }
+    ~ChunkMesh() { solid.Free(); water.Free(); }
 };
-static ChunkMesh gChunks[CHUNKS_X][CHUNKS_Z];
+// A mesh for every chunk that's lit and in view, by World::Key
+static std::unordered_map<uint64_t, std::unique_ptr<ChunkMesh>> gMeshes;
 
-static bool Occludes(uint8_t b) { return Info(b).opaque || b == LEAVES; }
+static bool Occludes(uint8_t b) { return Info(b).opaque || IsLeaves(b); }
 
 static bool ShouldDrawFace(uint8_t self, uint8_t nb, int ny) {
     if (ny < 0) return false;                 // nobody sees under the bedrock floor
@@ -353,6 +364,7 @@ static Vec3 Rgb(uint32_t c) { return {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0
 // The biome tint a block's face gets (white = untinted). face: FACES index
 static Vec3 FaceTint(const World& w, uint8_t b, int face, int x, int z) {
     if (b == GRASS && face == 2) return Rgb(w.GrassAt(x, z));
+    if (b == SHORT_GRASS || b == FERN) return Rgb(w.GrassAt(x, z));
     if (b == LEAVES)             return Rgb(w.FoliageAt(x, z));
     if (b == SPRUCE_LEAVES)      return Rgb(SPRUCE_FOLIAGE);
     if (b == BIRCH_LEAVES)       return Rgb(BIRCH_FOLIAGE);
@@ -362,9 +374,12 @@ static Vec3 FaceTint(const World& w, uint8_t b, int face, int x, int z) {
 
 // A quad (corners bottom-left, bottom-right, top-right, top-left of its
 // texture), wound so it faces along n whatever order the corners came in
+// Torches and plants are shown as flat sprites rather than little cubes
+static bool DrawsFlat(uint8_t item) { return IsTorch(item) || IsPlant(item); }
+
 // Colors for blocks shown outside the world (icons, dropped items): plains
 static Vec3 IconTint(uint8_t b) {
-    if (b == GRASS)         return Rgb(BiomeData(PLAINS).grass);
+    if (b == GRASS || b == SHORT_GRASS || b == FERN) return Rgb(BiomeData(PLAINS).grass);
     if (b == LEAVES)        return Rgb(BiomeData(PLAINS).foliage);
     if (b == SPRUCE_LEAVES) return Rgb(SPRUCE_FOLIAGE);
     if (b == BIRCH_LEAVES)  return Rgb(BIRCH_FOLIAGE);
@@ -443,16 +458,38 @@ static void AddTorchMesh(std::vector<float>& out, const World& w, uint8_t b, int
     q[0] = C(0, 0, 0); q[1] = C(1, 0, 0); q[2] = C(1, 0, 1); q[3] = C(0, 0, 1); PushBlockQuad(out, q, u0, v0, u1, v1, up * -1.0f, sky, blk);
 }
 
+// Grass and flowers: two quads crossing diagonally through the block, seen
+// from both sides, like Minecraft's "cross" model
+static void AddPlantMesh(std::vector<float>& out, const World& w, uint8_t b, int x, int y, int z) {
+    const float sky = (float)w.SkyLight(x, y, z), blk = (float)w.BlockLight(x, y, z);
+    const Vec3 tint = FaceTint(w, b, 2, x, z);
+    float u0, v0, u1, v1;
+    TileUV(Info(b).tileSide, u0, v0, u1, v1);
+    const float a = 0.15f, c = 0.85f;   // Minecraft's cross spans 0.8 of the block
+    Vec3 quads[2][4] = {
+        {{x + a, (float)y, z + a}, {x + c, (float)y, z + c}, {x + c, y + 1.0f, z + c}, {x + a, y + 1.0f, z + a}},
+        {{x + a, (float)y, z + c}, {x + c, (float)y, z + a}, {x + c, y + 1.0f, z + a}, {x + a, y + 1.0f, z + c}},
+    };
+    const Vec3 normals[2] = {Normalize({1, 0, -1}), Normalize({1, 0, 1})};
+    for (int k = 0; k < 2; ++k) {
+        PushBlockQuad(out, quads[k], u0, v0, u1, v1, normals[k], sky, blk, tint);
+        PushBlockQuad(out, quads[k], u0, v0, u1, v1, normals[k] * -1.0f, sky, blk, tint);
+    }
+}
+
 static void BuildChunk(const World& w, int cx, int cz, std::vector<float>& solid, std::vector<float>& water) {
     solid.clear(); water.clear();
     const int x0 = cx * CHUNK, z0 = cz * CHUNK;
+    const Chunk* chunk = w.GetChunk(cx, cz);
+    if (!chunk) return;
     for (int x = x0; x < x0 + CHUNK; ++x)
     for (int z = z0; z < z0 + CHUNK; ++z)
     for (int y = 0; y < WY; ++y) {
-        uint8_t b = w.blocks[World::Idx(x, y, z)];
+        uint8_t b = chunk->blocks[Chunk::Idx(x - x0, y, z - z0)];
         if (b == AIR) continue;
         if (IsTorch(b)) { AddTorchMesh(solid, w, b, x, y, z); continue; }
         if (b == SNOW || b == CACTUS) { AddShapeMesh(solid, w, b, x, y, z); continue; }
+        if (IsPlant(b)) { AddPlantMesh(solid, w, b, x, y, z); continue; }
         const BlockInfo& bi = Info(b);
         const bool isWater = b == WATER;
         const bool translucent = bi.translucent;          // water and ice go in the blended pass
@@ -528,37 +565,34 @@ static void BuildChunk(const World& w, int cx, int cz, std::vector<float>& solid
     }
 }
 
+static void MarkMeshDirty(int cx, int cz) {
+    auto it = gMeshes.find(World::Key(cx, cz));
+    if (it != gMeshes.end()) it->second->dirty = true;
+}
+
+// A block changed: re-mesh its chunk, and the neighbour if it's on the edge
 static void MarkDirtyAround(int x, int z) {
-    int cx = x / CHUNK, cz = z / CHUNK, lx = x % CHUNK, lz = z % CHUNK;
+    int cx = ChunkCoord(x), cz = ChunkCoord(z), lx = x & 15, lz = z & 15;
     for (int dx = -1; dx <= 1; ++dx)
         for (int dz = -1; dz <= 1; ++dz) {
             bool okx = dx == 0 || (dx == -1 && lx == 0) || (dx == 1 && lx == CHUNK - 1);
             bool okz = dz == 0 || (dz == -1 && lz == 0) || (dz == 1 && lz == CHUNK - 1);
-            int ncx = cx + dx, ncz = cz + dz;
-            if (okx && okz && ncx >= 0 && ncx < CHUNKS_X && ncz >= 0 && ncz < CHUNKS_Z)
-                gChunks[ncx][ncz].dirty = true;
+            if (okx && okz) MarkMeshDirty(cx + dx, cz + dz);
         }
 }
 
 // Re-mesh every chunk touching the box (faces sample light one block out)
 static void MarkDirtyBox(int x0, int z0, int x1, int z1) {
-    int cx0 = std::max(0, (x0 - 1) / CHUNK), cx1 = std::min(CHUNKS_X - 1, (x1 + 1) / CHUNK);
-    int cz0 = std::max(0, (z0 - 1) / CHUNK), cz1 = std::min(CHUNKS_Z - 1, (z1 + 1) / CHUNK);
-    for (int cx = cx0; cx <= cx1; ++cx)
-        for (int cz = cz0; cz <= cz1; ++cz) gChunks[cx][cz].dirty = true;
+    for (int cx = ChunkCoord(x0 - 1); cx <= ChunkCoord(x1 + 1); ++cx)
+        for (int cz = ChunkCoord(z0 - 1); cz <= ChunkCoord(z1 + 1); ++cz) MarkMeshDirty(cx, cz);
 }
 
-static void RebuildDirtyChunks(const World& w) {
+static void RebuildMesh(const World& w, int cx, int cz, ChunkMesh& m) {
     static std::vector<float> solid, water;
-    for (int cx = 0; cx < CHUNKS_X; ++cx)
-        for (int cz = 0; cz < CHUNKS_Z; ++cz) {
-            ChunkMesh& m = gChunks[cx][cz];
-            if (!m.dirty) continue;
-            BuildChunk(w, cx, cz, solid, water);
-            m.solid.Upload(solid, GL_DYNAMIC_DRAW);
-            m.water.Upload(water, GL_DYNAMIC_DRAW);
-            m.dirty = false;
-        }
+    BuildChunk(w, cx, cz, solid, water);
+    m.solid.Upload(solid, GL_DYNAMIC_DRAW);
+    m.water.Upload(water, GL_DYNAMIC_DRAW);
+    m.dirty = false;
 }
 
 // ============================================================================
@@ -744,9 +778,9 @@ struct Hud {
     // Blocks get the cube, everything else a flat sprite
     void ItemIcon(uint8_t item, float cx, float cy, float s) {
         if (item == AIR) return;
-        if (IsPlaceable(item) && !IsTorch(item)) { BlockIcon(item, cx, cy, s); return; }
+        if (IsPlaceable(item) && !DrawsFlat(item)) { BlockIcon(item, cx, cy, s); return; }
         const float p[4][2] = {{cx - s, cy + s}, {cx + s, cy + s}, {cx + s, cy - s}, {cx - s, cy - s}};
-        TileQuad(p, ItemTile(item), 1.0f);
+        TileQuad(p, ItemTile(item), 1.0f, IconTint(item));
     }
     // Pixel art; pal maps a character to a color (false = skip). Only
     // columns c0..c1 are drawn, which is how half hearts are made.
@@ -782,7 +816,7 @@ struct Hud {
     void DrawStack(const Stack& st, float x, float y, float s) {
         if (st.count <= 0) return;
         float cx = x + 8 * s, cy = y + 8 * s;
-        if (IsPlaceable(st.item) && !IsTorch(st.item)) ItemIcon(st.item, cx, cy, 6.2f * s);
+        if (IsPlaceable(st.item) && !DrawsFlat(st.item)) ItemIcon(st.item, cx, cy, 6.2f * s);
         else                      ItemIcon(st.item, cx, cy, 7.5f * s);
         if (st.count > 1) Number(st.count, x + 17 * s, y + 17 * s, s);
         int max = MaxDurability(st.item);
@@ -1052,7 +1086,7 @@ static void GiveOrToss(Stack s) {
 
 // Every furnace's contents, by position (Minecraft's block entities)
 static std::map<long long, FurnaceState> gFurnaces;
-static long long FurnaceKey(int x, int y, int z) { return ((long long)x * WZ + z) * WY + y; }
+static long long FurnaceKey(int x, int y, int z) { return BlockKey(x, y, z); }
 static FurnaceState* gOpenFurnace = nullptr;
 
 static void CloseScreen(bool recapture = true);
@@ -1063,7 +1097,7 @@ static void CloseScreen(bool recapture = true);
 static void SetBlock(int x, int y, int z, uint8_t b) {
     World& w = *gWorld;
     uint8_t old = w.Get(x, y, z);
-    if (old == b || y < 0 || y >= WY || !World::InXZ(x, z)) return;
+    if (old == b || y < 0 || y >= WY || !w.Loaded(x, z)) return;
     w.Set(x, y, z, b);
     MarkDirtyAround(x, z);
     LightBox lb = RelightAround(w, x, y, z);
@@ -1374,12 +1408,166 @@ static void LoadRecipes() {
 }
 
 // ============================================================================
+// Chunk streaming: chunks around the player are loaded or generated,
+// decorated, lit and meshed nearest-first on a per-frame time budget, and
+// the ones left far behind are saved and dropped.
+// ============================================================================
+static int  gRenderDistance = 10;          // chunks
+static int  gSpawnX = 0, gSpawnZ = 0;      // the world spawn column
+static bool gNeedsSpawn = false;           // put the player on the ground once it's loaded
+static std::string gWorldDir;              // where the world being played is saved
+
+static void TrackTorches(const Chunk& c, bool add) {
+    const int x0 = c.cx * CHUNK, z0 = c.cz * CHUNK;
+    if (!add) {
+        gTorches.erase(std::remove_if(gTorches.begin(), gTorches.end(), [&](const TorchPos& t) {
+            return t.x >= x0 && t.x < x0 + CHUNK && t.z >= z0 && t.z < z0 + CHUNK; }), gTorches.end());
+        return;
+    }
+    for (int lx = 0; lx < CHUNK; ++lx)
+        for (int lz = 0; lz < CHUNK; ++lz)
+            for (int y = 0; y < WY; ++y)
+                if (IsTorch(c.blocks[Chunk::Idx(lx, y, lz)])) gTorches.push_back({x0 + lx, y, z0 + lz});
+}
+
+// Chunk offsets within a radius, nearest first
+static const std::vector<std::pair<int, int>>& OffsetsByDistance(int radius) {
+    static int cached = -1;
+    static std::vector<std::pair<int, int>> list;
+    if (cached != radius) {
+        list.clear();
+        for (int dx = -radius; dx <= radius; ++dx)
+            for (int dz = -radius; dz <= radius; ++dz)
+                if (dx * dx + dz * dz <= radius * radius) list.push_back({dx, dz});
+        std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+            return a.first * a.first + a.second * a.second < b.first * b.first + b.second * b.second; });
+        cached = radius;
+    }
+    return list;
+}
+
+// Where streaming is centred: the player, or the spawn point while respawning
+static void StreamCenter(int& cx, int& cz) {
+    if (gNeedsSpawn) { cx = ChunkCoord(gSpawnX); cz = ChunkCoord(gSpawnZ); return; }
+    cx = ChunkCoord((int)std::floor(gPlayer.x));
+    cz = ChunkCoord((int)std::floor(gPlayer.z));
+}
+
+// Is the area around (cx, cz) ready to play in (lit and meshed)?
+static bool AreaReady(int cx, int cz, int radius) {
+    for (int dx = -radius; dx <= radius; ++dx)
+        for (int dz = -radius; dz <= radius; ++dz) {
+            const Chunk* c = gWorld->GetChunk(cx + dx, cz + dz);
+            if (!c || !c->lit) return false;
+            auto it = gMeshes.find(World::Key(cx + dx, cz + dz));
+            if (it == gMeshes.end() || it->second->dirty) return false;
+        }
+    return true;
+}
+
+static void UnloadChunk(Chunk& c) {
+    if (!gWorldDir.empty() && c.modified) {
+        std::string err;
+        if (!SaveChunk(gWorldDir, c, err)) std::printf("Couldn't save chunk %d,%d: %s\n", c.cx, c.cz, err.c_str());
+    }
+    TrackTorches(c, false);
+    gMeshes.erase(World::Key(c.cx, c.cz));
+    gWorld->RemoveChunk(c.cx, c.cz);
+}
+
+// One round of streaming work, stopping once `budget` seconds are used
+static void UpdateChunks(double budget) {
+    if (!gWorld) return;
+    World& w = *gWorld;
+    const double start = glfwGetTime();
+    auto outOfTime = [&] { return glfwGetTime() - start > budget; };
+    int pcx, pcz;
+    StreamCenter(pcx, pcz);
+    const int R = gRenderDistance;
+
+    // Edits near the player re-mesh right away, whatever the budget
+    for (int dx = -2; dx <= 2; ++dx)
+        for (int dz = -2; dz <= 2; ++dz) {
+            auto it = gMeshes.find(World::Key(pcx + dx, pcz + dz));
+            if (it != gMeshes.end() && it->second->dirty) RebuildMesh(w, pcx + dx, pcz + dz, *it->second);
+        }
+
+    for (const auto& off : OffsetsByDistance(R + 2)) {
+        if (outOfTime()) break;
+        const int cx = pcx + off.first, cz = pcz + off.second;
+        const int d2 = off.first * off.first + off.second * off.second;
+        Chunk* c = w.GetChunk(cx, cz);
+        if (!c) {                                             // 1. load it, or make its terrain
+            std::string problem;
+            if (!gWorldDir.empty() && LoadChunk(gWorldDir, w, cx, cz, &problem)) {
+                TrackTorches(*w.GetChunk(cx, cz), true);
+            } else {
+                if (!problem.empty()) std::printf("%s; generating it again\n", problem.c_str());
+                GenerateTerrain(w, w.EnsureChunk(cx, cz));
+            }
+            continue;
+        }
+        if (d2 > (R + 1) * (R + 1)) continue;
+        if (c->stage < STAGE_DECORATED) {                     // 2. trees and the rest
+            if (NeighboursAt(w, cx, cz, STAGE_TERRAIN)) DecorateChunk(w, *c);
+            continue;
+        }
+        if (d2 > R * R) continue;
+        if (!c->lit) {                                        // 3. light
+            if (!NeighboursAt(w, cx, cz, STAGE_DECORATED)) continue;
+            ComputeChunkTops(*c);
+            LightBox changed = RelightChunk(w, cx, cz);
+            c->lit = true;
+            if (!changed.Empty()) MarkDirtyBox(changed.x0, changed.z0, changed.x1, changed.z1);
+            gMeshes[World::Key(cx, cz)] = std::make_unique<ChunkMesh>();
+            continue;
+        }
+        auto it = gMeshes.find(World::Key(cx, cz));          // 4. mesh
+        if (it == gMeshes.end()) it = gMeshes.emplace(World::Key(cx, cz), std::make_unique<ChunkMesh>()).first;
+        if (it->second->dirty) RebuildMesh(w, cx, cz, *it->second);
+    }
+
+    // Save and drop chunks far behind (a little past the loading ring, so
+    // walking back and forth over a border doesn't thrash)
+    std::vector<Chunk*> far;
+    for (auto& kv : w.chunks) {
+        int dx = kv.second->cx - pcx, dz = kv.second->cz - pcz;
+        if (dx * dx + dz * dz > (R + 4) * (R + 4)) far.push_back(kv.second.get());
+    }
+    for (Chunk* c : far) UnloadChunk(*c);
+    // Meshes beyond the view distance aren't needed either
+    for (auto it = gMeshes.begin(); it != gMeshes.end();) {
+        int cx = (int)(int32_t)(it->first >> 32), cz = (int)(int32_t)(it->first & 0xFFFFFFFF);
+        int dx = cx - pcx, dz = cz - pcz;
+        it = (dx * dx + dz * dz > (R + 1) * (R + 1)) ? gMeshes.erase(it) : std::next(it);
+    }
+
+    // Respawning: once the spawn area exists, stand on its ground
+    if (gNeedsSpawn && AreaReady(pcx, pcz, 1)) {
+        if (!SpawnNear(w, gPlayer, gSpawnX, gSpawnZ)) {
+            int y = WY - 1;
+            while (y > 0 && !w.SolidAt(gSpawnX, y, gSpawnZ)) --y;
+            gPlayer.x = gSpawnX + 0.5; gPlayer.y = y + 1.0; gPlayer.z = gSpawnZ + 0.5;
+            gPlayer.px = gPlayer.x; gPlayer.py = gPlayer.y; gPlayer.pz = gPlayer.z;
+        }
+        gNeedsSpawn = false;
+    }
+}
+
+// Is the ground under the player loaded and lit (so physics can run)?
+static bool PlayerAreaReady() {
+    if (gNeedsSpawn) return false;
+    const Chunk* c = gWorld->ChunkAt((int)std::floor(gPlayer.x), (int)std::floor(gPlayer.z));
+    return c && c->lit;
+}
+
+// ============================================================================
 // Worlds: start, load, save, leave
 // ============================================================================
 enum class App { Title, Worlds, Create, ConfirmDelete, Playing };
 static App         gApp = App::Title;
 static bool        gPaused = false;
-static std::string gWorldDir, gWorldName;          // the world being played
+static std::string gWorldName;                     // the world being played
 static int         gAutosave = 0;                  // ticks since the last save
 static double      gSavedAt = -100;                // when "Saved" was last shown
 static std::string gMenuMessage;                   // e.g. why a world wouldn't load
@@ -1422,6 +1610,8 @@ static void ResetSession() {
     gEyeH = gPrevEyeH = (float)EYE_HEIGHT;
     gPaused = false;
     gAutosave = 0;
+    gNeedsSpawn = false;
+    gMeshes.clear();
 }
 
 // Writes the world being played. Items in a crafting grid or on the cursor
@@ -1433,6 +1623,8 @@ static bool SaveGame() {
     d.dayTime = gDayTime;
     d.lastPlayed = (long long)std::time(nullptr);
     d.player = gPlayer;
+    d.spawnX = gSpawnX;
+    d.spawnZ = gSpawnZ;
     d.inv = gInv;
     std::memcpy(d.creativeBar, gCreativeBar, sizeof gCreativeBar);
     d.selected = gSelected;
@@ -1454,15 +1646,32 @@ static bool SaveGame() {
     return true;
 }
 
-// The world is loaded into gWorld and the globals: get it on screen
+// The world is set up in gWorld and the globals: stream in the area around
+// the player (showing progress), then start playing
 static void EnterWorld() {
     gTorches.clear();
-    for (int x = 0; x < WX; ++x)
-        for (int z = 0; z < WZ; ++z)
-            for (int y = 0; y < WY; ++y)
-                if (IsTorch(gWorld->blocks[World::Idx(x, y, z)])) gTorches.push_back({x, y, z});
-    MarkDirtyBox(0, 0, WX - 1, WZ - 1);
-    RebuildDirtyChunks(*gWorld);
+    for (auto& kv : gWorld->chunks) TrackTorches(*kv.second, true);
+    double t0 = glfwGetTime(), shown = 0;
+    int cx, cz;
+    StreamCenter(cx, cz);
+    while (!AreaReady(cx, cz, 2) && glfwGetTime() - t0 < 30.0) {
+        UpdateChunks(0.05);
+        StreamCenter(cx, cz);
+        if (gShowMessage && glfwGetTime() - shown > 0.1) {
+            int ready = 0;
+            for (int dx = -2; dx <= 2; ++dx)
+                for (int dz = -2; dz <= 2; ++dz) {
+                    const Chunk* c = gWorld->GetChunk(cx + dx, cz + dz);
+                    ready += c && c->lit;
+                }
+            char msg[64];
+            std::snprintf(msg, sizeof msg, "PREPARING SPAWN AREA: %d%%", ready * 100 / 25);
+            gShowMessage(msg);
+            glfwPollEvents();
+            shown = glfwGetTime();
+        }
+    }
+    std::printf("Spawn area ready in %.2fs\n", glfwGetTime() - t0);
     gApp = App::Playing;
     gPaused = false;
     gMenuMessage.clear();
@@ -1472,17 +1681,18 @@ static void EnterWorld() {
 static void CreateNewWorld(const std::string& name, uint32_t seed, bool creative) {
     if (gShowMessage) gShowMessage("GENERATING WORLD...");
     ResetSession();
-    double t0 = glfwGetTime();
     gWorld = new World();
-    Generate(*gWorld, seed);
-    Spawn(*gWorld, gPlayer);
+    gWorld->seed = seed;
+    FindSpawnColumn(seed, gSpawnX, gSpawnZ);
+    gPlayer.x = gSpawnX + 0.5; gPlayer.z = gSpawnZ + 0.5; gPlayer.y = WY;
     gPlayer.yaw = PI * 0.25f;
     gPlayer.creative = creative;
+    gNeedsSpawn = true;
     gWorldName = name;
     gWorldDir = NewWorldDir(SAVES_ROOT, name);
-    std::printf("Created \"%s\" (seed %u) in %.2fs\n", name.c_str(), seed, glfwGetTime() - t0);
-    SaveGame();
+    std::printf("Creating \"%s\" (seed %u), spawn near %d, %d\n", name.c_str(), seed, gSpawnX, gSpawnZ);
     EnterWorld();
+    SaveGame();
 }
 
 static void OpenWorld(const SaveInfo& info) {
@@ -1497,6 +1707,12 @@ static void OpenWorld(const SaveInfo& info) {
         std::printf("Couldn't load %s: %s\n", info.dir.c_str(), err.c_str());
         return;
     }
+    if (d.convertedFromV1) {   // keep the original file: the next save replaces it with the new format
+        std::error_code ec;
+        std::filesystem::copy_file(info.dir + "/world.dat", info.dir + "/world_v1_backup.dat",
+                                   std::filesystem::copy_options::skip_existing, ec);
+        std::printf("Converting \"%s\" from the old 256x256 format (original kept as world_v1_backup.dat)\n", d.name.c_str());
+    }
     gWorld = w;
     gPlayer = d.player;
     gInv = d.inv;
@@ -1505,14 +1721,20 @@ static void OpenWorld(const SaveInfo& info) {
     gItems = d.items;
     gFurnaces = d.furnaces;
     gDayTime = d.dayTime;
+    gSpawnX = d.spawnX;
+    gSpawnZ = d.spawnZ;
     gWorldName = d.name;
     gWorldDir = info.dir;
     std::printf("Loaded \"%s\" from %s\n", gWorldName.c_str(), gWorldDir.c_str());
     EnterWorld();
+    SaveGame();   // writes out anything converted from an old save or generated while loading
 }
 
 static void LeaveWorld() {
     SaveGame();
+    std::vector<Chunk*> all;
+    for (auto& kv : gWorld->chunks) all.push_back(kv.second.get());
+    for (Chunk* c : all) UnloadChunk(*c);
     ResetSession();
     delete gWorld;
     gWorld = nullptr;
@@ -1954,7 +2176,7 @@ static void TickInteraction() {
     if (gPlaceDelay > 0) --gPlaceDelay;
     if (h.hit && IsPlaceable(held) && (gRmbLatch || (rmbHeld && gPlaceDelay == 0)) && (h.nx | h.ny | h.nz)) {
         int tx = h.x + h.nx, ty = h.y + h.ny, tz = h.z + h.nz;
-        if (w.Get(h.x, h.y, h.z) == SNOW) { tx = h.x; ty = h.y; tz = h.z; }   // placing on snow replaces it
+        if (IsReplaceable(w.Get(h.x, h.y, h.z))) { tx = h.x; ty = h.y; tz = h.z; }   // placing on snow or grass replaces it
         uint8_t cur = w.Get(tx, ty, tz);
         AABB cell = {(double)tx, (double)ty, (double)tz, tx + 1.0, ty + 1.0, tz + 1.0};
         bool blocked = Info(held).solid && Overlaps(p.Box(), cell);
@@ -1966,7 +2188,7 @@ static void TickInteraction() {
             place = FurnaceBlock(FacingToward(d.x, d.z), false);   // front faces you
         }
         if (place != AIR && !IsTorch(place) && !CanSurvive(w, place, tx, ty, tz)) place = AIR;   // e.g. cactus off sand
-        if (place != AIR && World::InXZ(tx, tz) && ty >= 0 && ty < WY && (cur == AIR || cur == WATER || cur == SNOW) && !blocked) {
+        if (place != AIR && w.Loaded(tx, tz) && ty >= 0 && ty < WY && IsReplaceable(cur) && !blocked) {
             SetBlock(tx, ty, tz, place);
             if (!p.creative) gInv.Take(gSelected, 1);
         }
@@ -2016,8 +2238,10 @@ static void GameTick() {
         in.sprint = down(GLFW_KEY_LEFT_CONTROL);
         in.usingItem = gEatTicks > 0;
     }
-    TickPlayer(*gWorld, gPlayer, in);
-    TickSurvival(*gWorld, gPlayer);
+    if (PlayerAreaReady()) {
+        TickPlayer(*gWorld, gPlayer, in);
+        TickSurvival(*gWorld, gPlayer);
+    }
 
     // ---- Death: the hotbar spills out, then you respawn ----
     if (!dead && !gPlayer.creative && gPlayer.health <= 0) {
@@ -2033,7 +2257,10 @@ static void GameTick() {
         gBreaking = false; gBreakProgress = 0; gEatTicks = 0;
         std::printf("You died!\n");
     } else if (dead && ++gDeadTicks > DEATH_SCREEN_TICKS) {
-        Respawn(*gWorld, gPlayer);
+        Respawn(gPlayer);
+        gPlayer.x = gSpawnX + 0.5; gPlayer.z = gSpawnZ + 0.5; gPlayer.y = WY;
+        gPlayer.px = gPlayer.x; gPlayer.py = gPlayer.y; gPlayer.pz = gPlayer.z;
+        gNeedsSpawn = true;   // streaming moves to the spawn, then places you on the ground
         gDeadTicks = 0;
     }
     TickItems(*gWorld, gItems, gPlayer, gInv, !gPlayer.creative && gDeadTicks == 0);
@@ -2046,8 +2273,8 @@ static void GameTick() {
     }
     for (const auto& kv : gFurnaces) {
         if (!kv.second.Lit() || Rand01() >= 0.1) continue;
-        long long k = kv.first;
-        int y = (int)(k % WY), z = (int)((k / WY) % WZ), x = (int)(k / WY / WZ);
+        int x, y, z;
+        UnpackBlockKey(kv.first, x, y, z);
         double dx = x - gPlayer.x, dz = z - gPlayer.z;
         if (dx * dx + dz * dz > 32.0 * 32.0) continue;
         SpawnFurnaceParticles(FurnaceFacing(gWorld->Get(x, y, z)), x, y, z);
@@ -2057,8 +2284,9 @@ static void GameTick() {
     // Furnaces keep burning whether or not anyone's looking
     for (auto& kv : gFurnaces) {
         if (!TickFurnace(kv.second, gRecipes)) continue;
-        long long k = kv.first;
-        int y = (int)(k % WY), z = (int)((k / WY) % WZ), x = (int)(k / WY / WZ);
+        int x, y, z;
+        UnpackBlockKey(kv.first, x, y, z);
+        if (!gWorld->Loaded(x, z)) continue;   // only loaded furnaces burn
         uint8_t b = gWorld->Get(x, y, z);
         if (IsFurnace(b)) SetBlock(x, y, z, FurnaceBlock(FurnaceFacing(b), kv.second.Lit()));   // swap lit/unlit
     }
@@ -2272,11 +2500,6 @@ int main(int argc, char** argv) {
         glGenerateMipmap(GL_TEXTURE_2D);
     }
 
-    for (int cx = 0; cx < CHUNKS_X; ++cx)
-        for (int cz = 0; cz < CHUNKS_Z; ++cz) {
-            gChunks[cx][cz].solid.Init({3, 2, 3, 1, 2, 3});
-            gChunks[cx][cz].water.Init({3, 2, 3, 1, 2, 3});
-        }
     LoadRecipes();
 
     DynMesh lines, overlay, clouds, hudMesh, crossMesh;
@@ -2393,7 +2616,7 @@ int main(int argc, char** argv) {
         if (gPaused) acc = 0;   // the world stands still while paused
         while (acc >= TICK) { GameTick(); acc -= TICK; }
         if (gApp != App::Playing) continue;   // a tick can't leave the world, but be safe
-        RebuildDirtyChunks(*gWorld);
+        UpdateChunks(0.006);                  // about a third of a 60 fps frame
         const float alpha = (float)(acc / TICK);
         const Player& p = gPlayer;
 
@@ -2459,7 +2682,8 @@ int main(int argc, char** argv) {
             skyColor = skyColor + (Vec3{0.98f, 0.52f, 0.22f} - skyColor) * k;
         }
         Vec3 fogColor = underwater ? Vec3{0.05f, 0.16f, 0.42f} * Lerp(0.15f, 1.0f, gDaylight) : skyColor;
-        float fogStart = underwater ? 0.0f : 110.0f, fogEnd = underwater ? 22.0f : 190.0f;
+        const float viewDist = (gRenderDistance - 1) * (float)CHUNK;
+        float fogStart = underwater ? 0.0f : viewDist * 0.65f, fogEnd = underwater ? 22.0f : viewDist;
 
         glViewport(0, 0, gFbW, gFbH);
         glClearColor(fogColor.x, fogColor.y, fogColor.z, 1.0f);
@@ -2513,12 +2737,12 @@ int main(int argc, char** argv) {
         glUniform1f(bFogEnd, fogEnd);
         glUniform1i(bTransl, 0);
         glDepthFunc(GL_LEQUAL);   // grass overlays sit exactly on their dirt faces
-        for (int cx = 0; cx < CHUNKS_X; ++cx)
-            for (int cz = 0; cz < CHUNKS_Z; ++cz) {
-                float dx = cx * CHUNK + 8 - camPos.x, dz = cz * CHUNK + 8 - camPos.z;
-                if (dx * dx + dz * dz > (fogEnd + 24) * (fogEnd + 24)) continue;   // hidden by fog anyway
-                gChunks[cx][cz].solid.DrawUploaded(GL_TRIANGLES);
-            }
+        for (const auto& kv : gMeshes) {
+            int cx = (int)(int32_t)(kv.first >> 32), cz = (int)(int32_t)(kv.first & 0xFFFFFFFF);
+            float dx = cx * CHUNK + 8 - camPos.x, dz = cz * CHUNK + 8 - camPos.z;
+            if (dx * dx + dz * dz > (fogEnd + 24) * (fogEnd + 24)) continue;   // hidden by fog anyway
+            kv.second->solid.DrawUploaded(GL_TRIANGLES);
+        }
 
         // ---- Dropped items: spinning, bobbing mini blocks (flat sprites for food) ----
         if (!gItems.empty()) {
@@ -2534,7 +2758,7 @@ int main(int argc, char** argv) {
                 int copies = e.stack.count > 16 ? 3 : (e.stack.count > 1 ? 2 : 1);   // bigger stacks look bigger
                 for (int k = 0; k < copies; ++k) {
                     Vec3 o = {k * 0.06f * std::cos(e.bobOffset + k), k * 0.05f, k * 0.06f * std::sin(e.bobOffset + k)};
-                    if (IsPlaceable(e.stack.item) && !IsTorch(e.stack.item))
+                    if (IsPlaceable(e.stack.item) && !DrawsFlat(e.stack.item))
                         AddItemCube(scratch, c + o + Vec3{0, 0.125f, 0}, 0.125f, spin, e.stack.item, light);
                     else
                         AddItemSprite(scratch, c + o + Vec3{0, 0.25f, 0}, 0.25f, spin, ItemTile(e.stack.item), light);
@@ -2643,8 +2867,7 @@ int main(int argc, char** argv) {
         glDisable(GL_CULL_FACE);
         glUseProgram(blockProg);
         glUniform1i(bTransl, 1);
-        for (int cx = 0; cx < CHUNKS_X; ++cx)
-            for (int cz = 0; cz < CHUNKS_Z; ++cz) gChunks[cx][cz].water.DrawUploaded(GL_TRIANGLES);
+        for (const auto& kv : gMeshes) kv.second->water.DrawUploaded(GL_TRIANGLES);
 
         // ---- Clouds ----
         if (!underwater) {
@@ -2653,11 +2876,14 @@ int main(int argc, char** argv) {
             float cl = Lerp(0.1f, 1.0f, gDaylight);   // clouds go gray-blue at night
             glUniform4f(sTint, cl, cl, Lerp(0.16f, 1.0f, gDaylight), 1);
             float drift = std::fmod((float)now * 0.6f, CLOUD_PERIOD);
-            for (float off : {drift, drift - CLOUD_PERIOD}) {
-                Mat4 mvp = viewProj * Translate({off, 0, 0});
-                glUniformMatrix4fv(sMVP, 1, GL_FALSE, mvp.m);
-                clouds.DrawUploaded(GL_TRIANGLES);
-            }
+            float baseX = std::floor((camPos.x - drift + 256) / CLOUD_PERIOD) * CLOUD_PERIOD + drift;
+            float baseZ = std::floor((camPos.z + 256) / CLOUD_PERIOD) * CLOUD_PERIOD;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    Mat4 mvp = viewProj * Translate({baseX + i * CLOUD_PERIOD, 0, baseZ + j * CLOUD_PERIOD});
+                    glUniformMatrix4fv(sMVP, 1, GL_FALSE, mvp.m);
+                    clouds.DrawUploaded(GL_TRIANGLES);
+                }
             glUniform4f(sTint, 1, 1, 1, 1);
         }
         glDepthMask(GL_TRUE);
@@ -2817,6 +3043,7 @@ int main(int argc, char** argv) {
             }
             if (gDeadTicks > 0) std::snprintf(buf, sizeof buf, "MyEngine | You died! Respawning...");
             if (gPaused) std::snprintf(buf, sizeof buf, "MyEngine | %s | Paused", gWorldName.c_str());
+            if (!PlayerAreaReady()) std::snprintf(buf, sizeof buf, "MyEngine | Loading terrain...");
             glfwSetWindowTitle(gWindow, buf);
         }
 

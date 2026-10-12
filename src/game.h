@@ -19,6 +19,9 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <climits>
+#include <memory>
+#include <unordered_map>
 
 namespace game {
 
@@ -76,11 +79,7 @@ constexpr double EXHAUSTION_BREAK     = 0.005;
 // ---------------------------------------------------------------------------
 // World dimensions
 // ---------------------------------------------------------------------------
-constexpr int CHUNK     = 16;
-constexpr int CHUNKS_X  = 16;
-constexpr int CHUNKS_Z  = 16;
-constexpr int WX        = CHUNK * CHUNKS_X;  // 256
-constexpr int WZ        = CHUNK * CHUNKS_Z;  // 256
+constexpr int CHUNK     = 16;                // chunks are 16 x 16 columns; the world is endless
 constexpr int WY        = 128;
 constexpr int SEA_LEVEL = 62;                // water fills every y below this
 
@@ -97,6 +96,8 @@ enum Block : uint8_t {
     LIT_FURNACE_PX, LIT_FURNACE_NX, LIT_FURNACE_PZ, LIT_FURNACE_NZ, // same, while burning
     SPRUCE_LOG, SPRUCE_LEAVES, SPRUCE_PLANKS, BIRCH_LOG, BIRCH_LEAVES, BIRCH_PLANKS,
     CACTUS, SNOW, SNOW_BLOCK, ICE,                                   // SNOW is the thin layer
+    SHORT_GRASS, FERN, DEAD_BUSH,                                    // plants: crossed quads, no collision
+    DANDELION, POPPY, CORNFLOWER, OXEYE_DAISY, AZURE_BLUET, ALLIUM, BLUE_ORCHID,
     BLOCK_COUNT
 };
 
@@ -116,6 +117,8 @@ enum Tile {
     T_GRASS_SNOW_SIDE, T_SPRUCE_LOG, T_SPRUCE_LOG_TOP, T_SPRUCE_LEAVES, T_SPRUCE_PLANKS,
     T_BIRCH_LOG, T_BIRCH_LOG_TOP, T_BIRCH_LEAVES, T_BIRCH_PLANKS,
     T_CACTUS_SIDE, T_CACTUS_TOP, T_CACTUS_BOTTOM, T_SNOW, T_ICE,
+    T_SHORT_GRASS, T_FERN, T_DEAD_BUSH, T_DANDELION, T_POPPY, T_CORNFLOWER, T_OXEYE_DAISY,
+    T_AZURE_BLUET, T_ALLIUM, T_BLUE_ORCHID,
     TILE_COUNT
 };
 
@@ -180,11 +183,25 @@ inline const BlockInfo& Info(uint8_t b) {
         {"Snow",           "snow",           0.1,  true,  false, false, false, T_SNOW,      T_SNOW,       T_SNOW,    SHOVEL,  0},
         {"Snow Block",     "snow_block",     0.2,  true,  true,  true,  false, T_SNOW,      T_SNOW,       T_SNOW,    SHOVEL,  0},
         {"Ice",            "ice",            0.5,  false, true,  false, true,  T_ICE,       T_ICE,        T_ICE,     PICKAXE, 0},
+        {"Grass",         "short_grass",    0.0,  false, false, false, false, T_SHORT_GRASS, T_SHORT_GRASS, T_SHORT_GRASS, NO_TOOL, 0},
+        {"Fern",          "fern",           0.0,  false, false, false, false, T_FERN,       T_FERN,       T_FERN,       NO_TOOL, 0},
+        {"Dead Bush",     "dead_bush",      0.0,  false, false, false, false, T_DEAD_BUSH,  T_DEAD_BUSH,  T_DEAD_BUSH,  NO_TOOL, 0},
+        {"Dandelion",     "dandelion",      0.0,  false, false, false, false, T_DANDELION,  T_DANDELION,  T_DANDELION,  NO_TOOL, 0},
+        {"Poppy",         "poppy",          0.0,  false, false, false, false, T_POPPY,      T_POPPY,      T_POPPY,      NO_TOOL, 0},
+        {"Cornflower",    "cornflower",     0.0,  false, false, false, false, T_CORNFLOWER, T_CORNFLOWER, T_CORNFLOWER, NO_TOOL, 0},
+        {"Oxeye Daisy",   "oxeye_daisy",    0.0,  false, false, false, false, T_OXEYE_DAISY, T_OXEYE_DAISY, T_OXEYE_DAISY, NO_TOOL, 0},
+        {"Azure Bluet",   "azure_bluet",    0.0,  false, false, false, false, T_AZURE_BLUET, T_AZURE_BLUET, T_AZURE_BLUET, NO_TOOL, 0},
+        {"Allium",        "allium",         0.0,  false, false, false, false, T_ALLIUM,     T_ALLIUM,     T_ALLIUM,     NO_TOOL, 0},
+        {"Blue Orchid",   "blue_orchid",    0.0,  false, false, false, false, T_BLUE_ORCHID, T_BLUE_ORCHID, T_BLUE_ORCHID, NO_TOOL, 0},
     };
     return table[b < BLOCK_COUNT ? b : 0];
 }
 
 inline bool IsLeaves(uint8_t b) { return b == LEAVES || b == SPRUCE_LEAVES || b == BIRCH_LEAVES; }
+inline bool IsPlant(uint8_t b)  { return b >= SHORT_GRASS && b <= BLUE_ORCHID; }
+inline bool IsFlower(uint8_t b) { return b >= DANDELION && b <= BLUE_ORCHID; }
+// Placing a block into one of these just replaces it (like Minecraft's grass)
+inline bool IsReplaceable(uint8_t b) { return b == AIR || b == WATER || b == SNOW || b == SHORT_GRASS || b == FERN || b == DEAD_BUSH; }
 inline bool IsLog(uint8_t b)    { return b == LOG || b == SPRUCE_LOG || b == BIRCH_LOG; }
 
 // Blocks that stop skylight from falling straight down (used for spawning)
@@ -480,77 +497,153 @@ constexpr uint32_t SPRUCE_FOLIAGE = 0x619961;
 constexpr uint32_t BIRCH_FOLIAGE  = 0x80A755;
 
 // ---------------------------------------------------------------------------
-// World storage
+// World storage: an endless grid of 16 x 16 x 128 chunks, made on demand
 // ---------------------------------------------------------------------------
+inline int FloorDiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }   // b > 0
+inline int ChunkCoord(int v) { return FloorDiv(v, CHUNK); }
+
+// Generation happens in stages, like Minecraft's chunk statuses
+enum ChunkStage : uint8_t {
+    STAGE_TERRAIN,     // ground, water and caves: depends only on the seed
+    STAGE_DECORATED,   // ores, trees, plants, snow: needs the 8 neighbours to exist
+};
+
+struct Chunk {
+    int cx = 0, cz = 0;
+    uint8_t stage = STAGE_TERRAIN;
+    bool lit = false;        // light computed (needs the 8 neighbours decorated)
+    bool modified = true;    // changed since it was last saved
+    uint8_t  blocks[CHUNK * CHUNK * WY];
+    uint8_t  light[CHUNK * CHUNK * WY];   // sky level << 4 | block-light level
+    int16_t  top[CHUNK * CHUNK];          // highest sky-blocking y per column
+    uint8_t  biome[CHUNK * CHUNK];
+    uint32_t grass[CHUNK * CHUNK], foliage[CHUNK * CHUNK], water[CHUNK * CHUNK];   // blended biome colors
+
+    Chunk() {
+        std::memset(blocks, AIR, sizeof blocks);
+        std::memset(light, 0, sizeof light);
+        for (int i = 0; i < CHUNK * CHUNK; ++i) {
+            top[i] = -1; biome[i] = PLAINS;
+            grass[i] = 0x91BD59; foliage[i] = 0x77AB2F; water[i] = 0x3F76E4;
+        }
+    }
+    static int Idx(int lx, int y, int lz) { return (lx * CHUNK + lz) * WY + y; }
+    static int Col(int lx, int lz) { return lx * CHUNK + lz; }
+};
+
 struct World {
-    std::vector<uint8_t> blocks;   // x-major, then z, then y (columns contiguous)
-    std::vector<int16_t> top;      // highest sky-blocking y per column, -1 if none
-    std::vector<uint8_t> light;    // per block: sky level << 4 | block-light level (0..15 each)
-    std::vector<uint8_t> biome;    // per column
-    // Per column colors, blended across nearby biomes so borders fade
-    std::vector<uint32_t> grassColor, foliageColor, waterColor;
     uint32_t seed = 0;
+    std::unordered_map<uint64_t, std::unique_ptr<Chunk>> chunks;
 
-    World() : blocks((size_t)WX * WY * WZ, AIR), top((size_t)WX * WZ, -1), light((size_t)WX * WY * WZ, 0xF0),
-              biome((size_t)WX * WZ, PLAINS), grassColor((size_t)WX * WZ, 0x91BD59),
-              foliageColor((size_t)WX * WZ, 0x77AB2F), waterColor((size_t)WX * WZ, 0x3F76E4) {}
+    static uint64_t Key(int cx, int cz) { return ((uint64_t)(uint32_t)cx << 32) | (uint32_t)cz; }
 
-    static size_t Col(int x, int z) { return (size_t)x * WZ + z; }
-    uint8_t BiomeAt(int x, int z) const { return InXZ(x, z) ? biome[Col(x, z)] : (uint8_t)OCEAN; }
-    // Colors with the world edge clamped
-    uint32_t GrassAt(int x, int z) const   { return grassColor[Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; }
-    uint32_t FoliageAt(int x, int z) const { return foliageColor[Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; }
-    uint32_t WaterAt(int x, int z) const   { return waterColor[Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; }
+    // The last chunk looked up is remembered: most lookups hit the same one
+    Chunk* GetChunk(int cx, int cz) const {
+        uint64_t k = Key(cx, cz);
+        if (k == cacheKey_) return cacheChunk_;
+        auto it = chunks.find(k);
+        cacheKey_ = k;
+        cacheChunk_ = it == chunks.end() ? nullptr : it->second.get();
+        return cacheChunk_;
+    }
+    Chunk* ChunkAt(int x, int z) const { return GetChunk(ChunkCoord(x), ChunkCoord(z)); }
+    Chunk& EnsureChunk(int cx, int cz) {
+        if (Chunk* c = GetChunk(cx, cz)) return *c;
+        auto c = std::make_unique<Chunk>();
+        c->cx = cx; c->cz = cz;
+        Chunk* raw = c.get();
+        chunks[Key(cx, cz)] = std::move(c);
+        cacheKey_ = Key(cx, cz); cacheChunk_ = raw;
+        return *raw;
+    }
+    void RemoveChunk(int cx, int cz) {
+        chunks.erase(Key(cx, cz));
+        cacheKey_ = ~0ull; cacheChunk_ = nullptr;
+    }
 
-    static bool InXZ(int x, int z) { return x >= 0 && x < WX && z >= 0 && z < WZ; }
-    static size_t Idx(int x, int y, int z) { return ((size_t)x * WZ + z) * WY + y; }
-
+    // Outside any loaded chunk: air to look at, a wall to walk into, open sky
     uint8_t Get(int x, int y, int z) const {
-        if (y < 0 || y >= WY || !InXZ(x, z)) return AIR;
-        return blocks[Idx(x, y, z)];
+        if (y < 0 || y >= WY) return AIR;
+        const Chunk* c = ChunkAt(x, z);
+        return c ? c->blocks[Chunk::Idx(x & 15, y, z & 15)] : (uint8_t)AIR;
     }
+    // Generation writes: creates the chunk if needed, doesn't track tops
     void SetRaw(int x, int y, int z, uint8_t b) {
-        if (y < 0 || y >= WY || !InXZ(x, z)) return;
-        blocks[Idx(x, y, z)] = b;
+        if (y < 0 || y >= WY) return;
+        Chunk& c = EnsureChunk(ChunkCoord(x), ChunkCoord(z));
+        c.blocks[Chunk::Idx(x & 15, y, z & 15)] = b;
+        c.modified = true;
     }
-    int TopAt(int x, int z) const { return InXZ(x, z) ? top[(size_t)x * WZ + z] : -1; }
-
-    void RecomputeTop(int x, int z) {
-        int y = WY - 1;
-        while (y >= 0 && !BlocksSky(blocks[Idx(x, y, z)])) --y;
-        top[(size_t)x * WZ + z] = (int16_t)y;
-    }
+    // Gameplay writes: only into loaded chunks; keeps the column top current
     void Set(int x, int y, int z, uint8_t b) {
-        if (y < 0 || y >= WY || !InXZ(x, z)) return;
-        blocks[Idx(x, y, z)] = b;
-        int16_t& t = top[(size_t)x * WZ + z];
+        if (y < 0 || y >= WY) return;
+        Chunk* c = ChunkAt(x, z);
+        if (!c) return;
+        c->blocks[Chunk::Idx(x & 15, y, z & 15)] = b;
+        c->modified = true;
+        int16_t& t = c->top[Chunk::Col(x & 15, z & 15)];
         if (BlocksSky(b) && y > t) t = (int16_t)y;
         else if (!BlocksSky(b) && y == t) RecomputeTop(x, z);
     }
-    // Collision: the world edge acts as an invisible wall; below y=0 is the void
-    bool SolidAt(int x, int y, int z) const {
-        if (!InXZ(x, z)) return true;
-        if (y < 0 || y >= WY) return false;
-        return Info(blocks[Idx(x, y, z)]).solid;
+    bool Loaded(int x, int z) const { return ChunkAt(x, z) != nullptr; }
+    int TopAt(int x, int z) const {
+        const Chunk* c = ChunkAt(x, z);
+        return c ? c->top[Chunk::Col(x & 15, z & 15)] : -1;
     }
-
-    // Outside the world is open sky; below the bottom is pitch black
+    void RecomputeTop(int x, int z) {
+        Chunk* c = ChunkAt(x, z);
+        if (!c) return;
+        int y = WY - 1;
+        while (y >= 0 && !BlocksSky(c->blocks[Chunk::Idx(x & 15, y, z & 15)])) --y;
+        c->top[Chunk::Col(x & 15, z & 15)] = (int16_t)y;
+    }
+    // Collision: unloaded chunks are walls, so nothing falls into ungenerated land
+    bool SolidAt(int x, int y, int z) const {
+        if (y < 0 || y >= WY) return false;
+        const Chunk* c = ChunkAt(x, z);
+        if (!c) return true;
+        return Info(c->blocks[Chunk::Idx(x & 15, y, z & 15)]).solid;
+    }
     int SkyLight(int x, int y, int z) const {
-        if (!InXZ(x, z) || y >= WY) return 15;
+        if (y >= WY) return 15;
         if (y < 0) return 0;
-        return light[Idx(x, y, z)] >> 4;
+        const Chunk* c = ChunkAt(x, z);
+        return c ? c->light[Chunk::Idx(x & 15, y, z & 15)] >> 4 : 15;
     }
     int BlockLight(int x, int y, int z) const {
-        if (y < 0 || y >= WY || !InXZ(x, z)) return 0;
-        return light[Idx(x, y, z)] & 15;
+        if (y < 0 || y >= WY) return 0;
+        const Chunk* c = ChunkAt(x, z);
+        return c ? c->light[Chunk::Idx(x & 15, y, z & 15)] & 15 : 0;
     }
+    uint8_t BiomeAt(int x, int z) const {
+        const Chunk* c = ChunkAt(x, z);
+        return c ? c->biome[Chunk::Col(x & 15, z & 15)] : (uint8_t)PLAINS;
+    }
+    uint32_t GrassAt(int x, int z) const   { const Chunk* c = ChunkAt(x, z); return c ? c->grass[Chunk::Col(x & 15, z & 15)] : 0x91BD59; }
+    uint32_t FoliageAt(int x, int z) const { const Chunk* c = ChunkAt(x, z); return c ? c->foliage[Chunk::Col(x & 15, z & 15)] : 0x77AB2F; }
+    uint32_t WaterAt(int x, int z) const   { const Chunk* c = ChunkAt(x, z); return c ? c->water[Chunk::Col(x & 15, z & 15)] : 0x3F76E4; }
+
+private:
+    mutable uint64_t cacheKey_ = ~0ull;
+    mutable Chunk*   cacheChunk_ = nullptr;
 };
+
+// A block position packed into one number (furnace lookups, saves)
+inline long long BlockKey(int x, int y, int z) {
+    return ((long long)(x & 0xFFFFFF) << 32) | ((long long)(z & 0xFFFFFF) << 8) | (long long)(y & 0xFF);
+}
+inline void UnpackBlockKey(long long k, int& x, int& y, int& z) {
+    auto sext = [](long long v) { return (int)((v & 0x800000) ? (v | ~0xFFFFFFLL) : v); };
+    x = sext((k >> 32) & 0xFFFFFF);
+    z = sext((k >> 8) & 0xFFFFFF);
+    y = (int)(k & 0xFF);
+}
 
 // ---------------------------------------------------------------------------
 // Light, the Minecraft way: two channels of 0..15 per block.
 //   sky light   15 falls straight down from the sky until something stops it,
 //               then spreads sideways and down, losing 1 per block
-//   block light given off by torches (14), spreading the same way
+//   block light given off by torches (14) and lit furnaces (13)
 // Opaque blocks stop light. Leaves and water let it through but stop the
 // full-strength fall, so the ground under trees and ponds is a bit dimmer.
 // ---------------------------------------------------------------------------
@@ -560,79 +653,93 @@ inline int LightEmission(uint8_t b) { return IsTorch(b) ? 14 : (IsLitFurnace(b) 
 inline int LightCost(uint8_t b) { return Info(b).opaque ? 15 : 1; }
 
 // Full skylight only keeps falling through clear blocks
-inline bool SkyFallsThrough(uint8_t b) { return b == AIR || b == GLASS || b == SNOW || IsTorch(b); }
+inline bool SkyFallsThrough(uint8_t b) { return b == AIR || b == GLASS || b == SNOW || IsTorch(b) || IsPlant(b); }
 
 struct LightBox {
     int x0 = 0, y0 = 0, z0 = 0, x1 = -1, y1 = -1, z1 = -1;
     bool Empty() const { return x1 < x0; }
+    void Add(int x, int y, int z) {
+        if (Empty()) { x0 = x1 = x; y0 = y1 = y; z0 = z1 = z; return; }
+        x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y); z0 = std::min(z0, z); z1 = std::max(z1, z);
+    }
 };
 
-// Recomputes all light inside the box [x0..x1] x [y0..y1] x [z0..z1],
-// treating the light just outside it as fixed. Returns the cells whose
-// light actually changed, so only those chunks need re-meshing.
+// Recomputes all light inside the box [x0..x1] x [y0..y1] x [z0..z1] (in
+// loaded chunks only), treating the light just outside it as fixed.
+// Returns the cells whose light actually changed, so only those chunks need
+// re-meshing.
 inline LightBox RelightBox(World& w, int x0, int y0, int z0, int x1, int y1, int z1) {
-    x0 = std::max(x0, 0); z0 = std::max(z0, 0); y0 = std::max(y0, 0);
-    x1 = std::min(x1, WX - 1); z1 = std::min(z1, WZ - 1); y1 = std::min(y1, WY - 1);
+    y0 = std::max(y0, 0); y1 = std::min(y1, WY - 1);
     LightBox changed;
     if (x1 < x0 || y1 < y0 || z1 < z0) return changed;
 
-    const int bx = x1 - x0 + 1, by = y1 - y0 + 1, bz = z1 - z0 + 1;
+    // Chunk pointers for the box plus one block of margin, looked up once
+    const int gcx0 = ChunkCoord(x0 - 1), gcz0 = ChunkCoord(z0 - 1);
+    const int gw = ChunkCoord(x1 + 1) - gcx0 + 1, gd = ChunkCoord(z1 + 1) - gcz0 + 1;
+    std::vector<Chunk*> grid((size_t)gw * gd);
+    for (int i = 0; i < gw; ++i)
+        for (int k = 0; k < gd; ++k) grid[(size_t)i * gd + k] = w.GetChunk(gcx0 + i, gcz0 + k);
+    auto chunkOf = [&](int x, int z) -> Chunk* { return grid[(size_t)(ChunkCoord(x) - gcx0) * gd + (ChunkCoord(z) - gcz0)]; };
     auto inBox = [&](int x, int y, int z) { return x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1; };
 
-    // Remember the old values so we can report what changed
-    std::vector<uint8_t> old((size_t)bx * by * bz);
+    // Remember old values (to report changes) and clear the box
+    const int bx = x1 - x0 + 1, by = y1 - y0 + 1, bz = z1 - z0 + 1;
+    std::vector<uint8_t> old((size_t)bx * by * bz, 0);
     auto boxIdx = [&](int x, int y, int z) { return ((size_t)(x - x0) * bz + (z - z0)) * by + (y - y0); };
     for (int x = x0; x <= x1; ++x)
-        for (int z = z0; z <= z1; ++z)
+        for (int z = z0; z <= z1; ++z) {
+            Chunk* c = chunkOf(x, z);
+            if (!c) continue;
             for (int y = y0; y <= y1; ++y) {
-                size_t i = World::Idx(x, y, z);
-                old[boxIdx(x, y, z)] = w.light[i];
-                w.light[i] = 0;
+                uint8_t& l = c->light[Chunk::Idx(x & 15, y, z & 15)];
+                old[boxIdx(x, y, z)] = l;
+                l = 0;
             }
-
-    // Where full skylight stops falling in each column, with one column of
-    // margin so we can tell which sky cells have a darker neighbor
-    const int mz = bz + 2;
-    std::vector<int> fall((size_t)(bx + 2) * mz, 0);
-    auto fallAt = [&](int x, int z) -> int {
-        if (!World::InXZ(x, z)) return 0;   // outside the world: open sky all the way down
-        return fall[(size_t)(x - x0 + 1) * mz + (z - z0 + 1)];
-    };
-    for (int x = x0 - 1; x <= x1 + 1; ++x)
-        for (int z = z0 - 1; z <= z1 + 1; ++z) {
-            if (!World::InXZ(x, z)) continue;
-            int y = WY;
-            while (y > 0 && SkyFallsThrough(w.blocks[World::Idx(x, y - 1, z)])) --y;
-            fall[(size_t)(x - x0 + 1) * mz + (z - z0 + 1)] = y;   // cells y..WY-1 get full sky
         }
 
+    // Where full skylight stops falling in each column (with a column of margin)
+    const int mz = bz + 2;
+    std::vector<int> fall((size_t)(bx + 2) * mz, 0);
+    for (int x = x0 - 1; x <= x1 + 1; ++x)
+        for (int z = z0 - 1; z <= z1 + 1; ++z) {
+            Chunk* c = chunkOf(x, z);
+            int y = WY;
+            if (c) while (y > 0 && SkyFallsThrough(c->blocks[Chunk::Idx(x & 15, y - 1, z & 15)])) --y;
+            else y = 0;   // unloaded: treat as open sky
+            fall[(size_t)(x - x0 + 1) * mz + (z - z0 + 1)] = y;
+        }
+    auto fallAt = [&](int x, int z) { return fall[(size_t)(x - x0 + 1) * mz + (z - z0 + 1)]; };
+
+    // Queue entries are positions relative to the box (with 1 of margin)
+    auto pack = [&](int x, int y, int z) { return ((uint32_t)(x - x0 + 1) << 20) | ((uint32_t)(z - z0 + 1) << 8) | (uint32_t)y; };
     std::vector<uint32_t> skyQ, blockQ;
     for (int x = x0; x <= x1; ++x)
         for (int z = z0; z <= z1; ++z) {
+            Chunk* c = chunkOf(x, z);
+            if (!c) continue;
             const int f = fallAt(x, z);
-            const int nf = std::max(std::max(fallAt(x - 1, z), fallAt(x + 1, z)),
-                                    std::max(fallAt(x, z - 1), fallAt(x, z + 1)));
+            const int nf = std::max(std::max(fallAt(x - 1, z), fallAt(x + 1, z)), std::max(fallAt(x, z - 1), fallAt(x, z + 1)));
             for (int y = std::max(f, y0); y <= y1; ++y) {
-                size_t i = World::Idx(x, y, z);
-                w.light[i] |= 0xF0;
-                // Only sky cells next to something darker need to spread
-                if (y == f || y < nf) skyQ.push_back((uint32_t)i);
+                c->light[Chunk::Idx(x & 15, y, z & 15)] |= 0xF0;
+                if (y == f || y < nf) skyQ.push_back(pack(x, y, z));   // only cells beside something darker spread
             }
             for (int y = y0; y <= y1; ++y) {
-                size_t i = World::Idx(x, y, z);
-                if (int e = LightEmission(w.blocks[i])) {
-                    w.light[i] = (uint8_t)((w.light[i] & 0xF0) | e);
-                    blockQ.push_back((uint32_t)i);
+                uint8_t& l = c->light[Chunk::Idx(x & 15, y, z & 15)];
+                if (int e = LightEmission(c->blocks[Chunk::Idx(x & 15, y, z & 15)])) {
+                    l = (uint8_t)((l & 0xF0) | e);
+                    blockQ.push_back(pack(x, y, z));
                 }
             }
         }
 
-    // Light from just outside the box flows in
+    // Light just outside the box flows in
     auto seedEdge = [&](int x, int y, int z) {
-        if (y < 0 || y >= WY || !World::InXZ(x, z)) return;
-        size_t i = World::Idx(x, y, z);
-        if ((w.light[i] >> 4) > 1)  skyQ.push_back((uint32_t)i);
-        if ((w.light[i] & 15) > 1)  blockQ.push_back((uint32_t)i);
+        if (y < 0 || y >= WY) return;
+        Chunk* c = chunkOf(x, z);
+        if (!c) return;
+        uint8_t l = c->light[Chunk::Idx(x & 15, y, z & 15)];
+        if ((l >> 4) > 1) skyQ.push_back(pack(x, y, z));
+        if ((l & 15) > 1) blockQ.push_back(pack(x, y, z));
     };
     for (int x = x0; x <= x1; ++x)
         for (int z = z0; z <= z1; ++z) { seedEdge(x, y0 - 1, z); seedEdge(x, y1 + 1, z); }
@@ -645,17 +752,19 @@ inline LightBox RelightBox(World& w, int x0, int y0, int z0, int x1, int y1, int
     static const int DIRS[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
     auto flood = [&](std::vector<uint32_t>& q, int shift) {
         for (size_t head = 0; head < q.size(); ++head) {
-            uint32_t i = q[head];
-            int x = (int)(i / ((uint32_t)WZ * WY)), z = (int)((i / WY) % WZ), y = (int)(i % WY);
-            int level = (w.light[i] >> shift) & 15;
+            uint32_t e = q[head];
+            int x = (int)(e >> 20) + x0 - 1, z = (int)((e >> 8) & 0xFFF) + z0 - 1, y = (int)(e & 0xFF);
+            int level = (chunkOf(x, z)->light[Chunk::Idx(x & 15, y, z & 15)] >> shift) & 15;
             for (const auto& d : DIRS) {
                 int nx = x + d[0], ny = y + d[1], nz = z + d[2];
                 if (!inBox(nx, ny, nz)) continue;
-                size_t n = World::Idx(nx, ny, nz);
-                int nl = level - LightCost(w.blocks[n]);
-                if (nl <= ((w.light[n] >> shift) & 15)) continue;
-                w.light[n] = (uint8_t)((w.light[n] & ~(15 << shift)) | (nl << shift));
-                q.push_back((uint32_t)n);
+                Chunk* c = chunkOf(nx, nz);
+                if (!c) continue;
+                const int i = Chunk::Idx(nx & 15, ny, nz & 15);
+                int nl = level - LightCost(c->blocks[i]);
+                if (nl <= ((c->light[i] >> shift) & 15)) continue;
+                c->light[i] = (uint8_t)((c->light[i] & ~(15 << shift)) | (nl << shift));
+                q.push_back(pack(nx, ny, nz));
             }
         }
     };
@@ -663,14 +772,12 @@ inline LightBox RelightBox(World& w, int x0, int y0, int z0, int x1, int y1, int
     flood(blockQ, 0);
 
     for (int x = x0; x <= x1; ++x)
-        for (int z = z0; z <= z1; ++z)
+        for (int z = z0; z <= z1; ++z) {
+            Chunk* c = chunkOf(x, z);
+            if (!c) continue;
             for (int y = y0; y <= y1; ++y)
-                if (w.light[World::Idx(x, y, z)] != old[boxIdx(x, y, z)]) {
-                    if (changed.Empty()) { changed.x0 = changed.x1 = x; changed.y0 = changed.y1 = y; changed.z0 = changed.z1 = z; continue; }
-                    changed.x0 = std::min(changed.x0, x); changed.x1 = std::max(changed.x1, x);
-                    changed.y0 = std::min(changed.y0, y); changed.y1 = std::max(changed.y1, y);
-                    changed.z0 = std::min(changed.z0, z); changed.z1 = std::max(changed.z1, z);
-                }
+                if (c->light[Chunk::Idx(x & 15, y, z & 15)] != old[boxIdx(x, y, z)]) changed.Add(x, y, z);
+        }
     return changed;
 }
 
@@ -680,11 +787,26 @@ inline LightBox RelightAround(World& w, int x, int y, int z) {
     return RelightBox(w, x - 16, 0, z - 16, x + 16, y + 16, z + 16);
 }
 
-inline void RelightAll(World& w) { RelightBox(w, 0, 0, 0, WX - 1, WY - 1, WZ - 1); }
+// A chunk's own light plus 15 blocks into its neighbours, where its light reaches
+inline LightBox RelightChunk(World& w, int cx, int cz) {
+    return RelightBox(w, cx * CHUNK - 15, 0, cz * CHUNK - 15, cx * CHUNK + CHUNK + 14, WY - 1, cz * CHUNK + CHUNK + 14);
+}
+
+// Everything loaded at once (tests, conversions)
+inline void RelightAll(World& w) {
+    if (w.chunks.empty()) return;
+    int cx0 = INT32_MAX, cz0 = INT32_MAX, cx1 = INT32_MIN, cz1 = INT32_MIN;
+    for (const auto& kv : w.chunks) {
+        cx0 = std::min(cx0, kv.second->cx); cx1 = std::max(cx1, kv.second->cx);
+        cz0 = std::min(cz0, kv.second->cz); cz1 = std::max(cz1, kv.second->cz);
+    }
+    RelightBox(w, cx0 * CHUNK, 0, cz0 * CHUNK, cx1 * CHUNK + CHUNK - 1, WY - 1, cz1 * CHUNK + CHUNK - 1);
+    for (auto& kv : w.chunks) kv.second->lit = true;
+}
 
 // Can this block stay where it is? Torches need the block they hang on,
 // cactus needs sand (or more cactus) below and nothing solid beside it,
-// a snow layer needs a full block or leaves underneath.
+// snow needs a full block or leaves underneath, plants need soil.
 inline bool CanSurvive(const World& w, uint8_t b, int x, int y, int z) {
     if (IsTorch(b)) {
         int sx, sy, sz;
@@ -700,11 +822,17 @@ inline bool CanSurvive(const World& w, uint8_t b, int x, int y, int z) {
         uint8_t below = w.Get(x, y - 1, z);
         return (Info(below).opaque || IsLeaves(below)) && below != ICE;
     }
+    if (IsPlant(b)) {
+        uint8_t below = w.Get(x, y - 1, z);
+        if (b == DEAD_BUSH) return below == SAND || below == DIRT || below == GRASS;
+        return below == GRASS || below == DIRT;
+    }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Terrain generation: gentle plains with ponds, oak trees, ores, bedrock
+// Terrain generation: biomes from smooth climate noise, then caves, ores,
+// trees, plants and snow
 // ---------------------------------------------------------------------------
 // Oak (trunk 4..6) and birch (trunk 5..7) share Minecraft's blob canopy
 inline void PlaceOakTree(World& w, int x, int baseY, int z, uint32_t seed, bool birch = false) {
@@ -723,7 +851,8 @@ inline void PlaceOakTree(World& w, int x, int baseY, int z, uint32_t seed, bool 
                     if (rel == 0) continue;
                     if (Hash01(x + dx, y, z + dz, seed + 13) < 0.5) continue;
                 }
-                if (w.Get(x + dx, y, z + dz) == AIR) w.SetRaw(x + dx, y, z + dz, LEAF);
+                uint8_t cur = w.Get(x + dx, y, z + dz);
+                if (cur == AIR || IsPlant(cur)) w.SetRaw(x + dx, y, z + dz, LEAF);
             }
     }
     for (int i = 0; i < h; ++i) w.SetRaw(x, baseY + i, z, LOGB);
@@ -743,7 +872,8 @@ inline void PlaceSpruceTree(World& w, int x, int baseY, int z, uint32_t seed) {
         for (int dx = -r; dx <= r; ++dx)
             for (int dz = -r; dz <= r; ++dz) {
                 if (r > 0 && std::abs(dx) == r && std::abs(dz) == r) continue;   // round off corners
-                if (w.Get(x + dx, y, z + dz) == AIR) w.SetRaw(x + dx, y, z + dz, SPRUCE_LEAVES);
+                uint8_t cur = w.Get(x + dx, y, z + dz);
+                if (cur == AIR || IsPlant(cur)) w.SetRaw(x + dx, y, z + dz, SPRUCE_LEAVES);
             }
         // Grow the ring each layer; when it reaches its limit, pull back in
         if (r >= ring) { r = (ring > 1 && Hash01(x, y, z, seed + 17) < 0.5) ? 1 : 0; ring = std::min(ring + 1, maxR); }
@@ -779,32 +909,39 @@ inline uint64_t ChunkSeed(uint32_t seed, int cx, int cz, int salt) {
 // ---------------------------------------------------------------------------
 // Caves: Minecraft's classic "worm" carver (pre-1.18). Tunnels wander with a
 // smoothly changing heading, swell in the middle, sometimes split in two,
-// and sometimes start from a wide, flat room.
+// and sometimes start from a wide, flat room. Each chunk replays the
+// tunnels that start up to 8 chunks away and keeps only the part inside
+// itself, so caves cross chunk borders seamlessly.
 // ---------------------------------------------------------------------------
+constexpr int CAVE_RANGE = 8;   // chunks
+
 inline bool Carvable(uint8_t b) { return b == STONE || b == DIRT || b == GRASS || b == SAND; }
 
-inline void CarveBlob(World& w, double cx, double cy, double cz, double rh, double rv) {
-    const int x0 = (int)std::floor(cx - rh) - 1, x1 = (int)std::floor(cx + rh) + 1;
+struct CarveTarget { World* w; Chunk* c; int x0, z0; };   // the chunk being carved
+
+inline void CarveBlob(const CarveTarget& t, double cx, double cy, double cz, double rh, double rv) {
+    // Only the part of the blob inside the target chunk
+    const int x0 = std::max(t.x0, (int)std::floor(cx - rh) - 1), x1 = std::min(t.x0 + 15, (int)std::floor(cx + rh) + 1);
+    const int z0 = std::max(t.z0, (int)std::floor(cz - rh) - 1), z1 = std::min(t.z0 + 15, (int)std::floor(cz + rh) + 1);
     const int y0 = std::max(1, (int)std::floor(cy - rv) - 1), y1 = std::min(WY - 1, (int)std::floor(cy + rv) + 1);
-    const int z0 = (int)std::floor(cz - rh) - 1, z1 = (int)std::floor(cz + rh) + 1;
+    if (x0 > x1 || z0 > z1 || y0 > y1) return;
     // Never cut into water: the pond would hang over an open cave
     for (int x = x0; x <= x1; ++x)
         for (int z = z0; z <= z1; ++z)
             for (int y = y0; y <= y1; ++y)
-                if (w.Get(x, y, z) == WATER) return;
-    for (int x = x0 + 1; x < x1; ++x)
-        for (int z = z0 + 1; z < z1; ++z) {
-            if (!World::InXZ(x, z)) continue;
-            for (int y = y0 + 1; y < y1; ++y) {
+                if (t.c->blocks[Chunk::Idx(x - t.x0, y, z - t.z0)] == WATER) return;
+    for (int x = x0; x <= x1; ++x)
+        for (int z = z0; z <= z1; ++z)
+            for (int y = y0; y <= y1; ++y) {
                 double dx = (x + 0.5 - cx) / rh, dy = (y + 0.5 - cy) / rv, dz = (z + 0.5 - cz) / rh;
                 if (dy <= -0.7) continue;                      // flat-ish floors
                 if (dx * dx + dy * dy + dz * dz >= 1.0) continue;
-                if (Carvable(w.Get(x, y, z))) w.SetRaw(x, y, z, AIR);
+                uint8_t& b = t.c->blocks[Chunk::Idx(x - t.x0, y, z - t.z0)];
+                if (Carvable(b)) b = AIR;
             }
-        }
 }
 
-inline void CarveTunnel(World& w, GenRng& r, double x, double y, double z, float thickness,
+inline void CarveTunnel(const CarveTarget& t, GenRng& r, double x, double y, double z, float thickness,
                         float yaw, float pitch, int length) {
     const float PIf = 3.14159265f;
     float yawD = 0, pitchD = 0;
@@ -823,35 +960,38 @@ inline void CarveTunnel(World& w, GenRng& r, double x, double y, double z, float
         pitchD += (float)((r.Float() - r.Float()) * r.Float() * 2.0);
         yawD += (float)((r.Float() - r.Float()) * r.Float() * 4.0);
         if (step == split) {   // fork into two thinner tunnels going left and right
-            CarveTunnel(w, r, x, y, z, (float)(r.Float() * 0.5 + 0.5), yaw - PIf / 2, pitch / 3.0f, length - step);
-            CarveTunnel(w, r, x, y, z, (float)(r.Float() * 0.5 + 0.5), yaw + PIf / 2, pitch / 3.0f, length - step);
+            CarveTunnel(t, r, x, y, z, (float)(r.Float() * 0.5 + 0.5), yaw - PIf / 2, pitch / 3.0f, length - step);
+            CarveTunnel(t, r, x, y, z, (float)(r.Float() * 0.5 + 0.5), yaw + PIf / 2, pitch / 3.0f, length - step);
             return;
         }
         if (r.Int(4) == 0) continue;   // skipping some steps makes the walls lumpy
-        CarveBlob(w, x, y, z, rh, rh);
+        // Cheap reject: this blob can't touch the target chunk
+        if (x + rh + 2 < t.x0 || x - rh - 2 > t.x0 + 16 || z + rh + 2 < t.z0 || z - rh - 2 > t.z0 + 16) continue;
+        CarveBlob(t, x, y, z, rh, rh);
     }
 }
 
-inline void CarveCaves(World& w, uint32_t seed) {
-    for (int cx = 0; cx < CHUNKS_X; ++cx)
-        for (int cz = 0; cz < CHUNKS_Z; ++cz) {
-            GenRng r(ChunkSeed(seed, cx, cz, 1));
+inline void CarveCavesInto(World& w, Chunk& c) {
+    CarveTarget t{&w, &c, c.cx * CHUNK, c.cz * CHUNK};
+    for (int sx = c.cx - CAVE_RANGE; sx <= c.cx + CAVE_RANGE; ++sx)
+        for (int sz = c.cz - CAVE_RANGE; sz <= c.cz + CAVE_RANGE; ++sz) {
+            GenRng r(ChunkSeed(w.seed, sx, sz, 1));
             if (r.Int(7) != 0) continue;   // about 1 chunk in 7 starts a cave system
             int count = r.Int(r.Int(r.Int(15) + 1) + 1);
             for (int i = 0; i < count; ++i) {
-                double x = cx * CHUNK + r.Int(CHUNK), y = r.Int(r.Int(120) + 8), z = cz * CHUNK + r.Int(CHUNK);
+                double x = sx * CHUNK + r.Int(CHUNK), y = r.Int(r.Int(120) + 8), z = sz * CHUNK + r.Int(CHUNK);
                 int tunnels = 1;
                 if (r.Int(4) == 0) {   // a room: a wide, squashed blob
                     double rad = 1.5 + 1.0 + r.Float() * 6.0;
-                    CarveBlob(w, x + 1, y, z, rad, rad * 0.5);
+                    CarveBlob(t, x + 1, y, z, rad, rad * 0.5);
                     tunnels += r.Int(4);
                 }
-                for (int t = 0; t < tunnels; ++t) {
+                for (int k = 0; k < tunnels; ++k) {
                     float yaw = (float)(r.Float() * 6.2831853);
                     float pitch = (float)((r.Float() - 0.5) / 4.0);
                     float thickness = (float)(r.Float() * 2.0 + r.Float());
                     if (r.Int(10) == 0) thickness *= (float)(r.Float() * r.Float() * 3.0 + 1.0);   // the odd huge one
-                    CarveTunnel(w, r, x, y, z, thickness, yaw, pitch, 112 - r.Int(28));
+                    CarveTunnel(t, r, x, y, z, thickness, yaw, pitch, 112 - r.Int(28));
                 }
             }
         }
@@ -895,22 +1035,19 @@ inline const OreRule* OreRules(int& n) {
     return rules;
 }
 
-inline void PlaceOres(World& w, uint32_t seed) {
+inline void PlaceOresIn(World& w, const Chunk& c) {
     int n;
     const OreRule* rules = OreRules(n);
-    for (int cx = 0; cx < CHUNKS_X; ++cx)
-        for (int cz = 0; cz < CHUNKS_Z; ++cz) {
-            GenRng r(ChunkSeed(seed, cx, cz, 2));
-            for (int i = 0; i < n; ++i) {
-                const OreRule& o = rules[i];
-                for (int v = 0; v < o.veinsPerChunk; ++v) {
-                    int x = cx * CHUNK + r.Int(CHUNK), z = cz * CHUNK + r.Int(CHUNK);
-                    int y = o.minY + r.Int(o.maxY - o.minY + 1);
-                    if (o.size == 1) { if (w.Get(x, y, z) == STONE) w.SetRaw(x, y, z, o.ore); }
-                    else PlaceVein(w, r, x, y, z, o.size, o.ore);
-                }
-            }
+    GenRng r(ChunkSeed(w.seed, c.cx, c.cz, 2));
+    for (int i = 0; i < n; ++i) {
+        const OreRule& o = rules[i];
+        for (int v = 0; v < o.veinsPerChunk; ++v) {
+            int x = c.cx * CHUNK + r.Int(CHUNK), z = c.cz * CHUNK + r.Int(CHUNK);
+            int y = o.minY + r.Int(o.maxY - o.minY + 1);
+            if (o.size == 1) { if (w.Get(x, y, z) == STONE) w.SetRaw(x, y, z, o.ore); }
+            else PlaceVein(w, r, x, y, z, o.size, o.ore);
         }
+    }
 }
 
 inline double SmoothStep(double a, double b, double x) {
@@ -971,53 +1108,68 @@ inline void ShapeColumn(const Climate& c, int& outH, uint8_t& outBiome) {
     else                                            outBiome = PLAINS;
 }
 
-// Averages biome colors over a 9x9 area so grass and water fade between biomes
-inline void BlendBiomeColors(World& w) {
-    const int R = 4;
-    for (int x = 0; x < WX; ++x)
-        for (int z = 0; z < WZ; ++z) {
-            int sum[3][3] = {};
-            int n = 0;
+// A chunk's biomes, colors (averaged over 9x9 so borders fade) and column
+// tops, all of which come from the seed and blocks, so they're never saved
+inline void ComputeChunkBiomes(const ClimateNoise& noise, Chunk& c) {
+    const int R = 4, N = CHUNK + 2 * R;
+    uint8_t area[N][N];
+    for (int i = 0; i < N; ++i)
+        for (int k = 0; k < N; ++k) {
+            int h;
+            ShapeColumn(noise.At(c.cx * CHUNK + i - R, c.cz * CHUNK + k - R), h, area[i][k]);
+        }
+    for (int lx = 0; lx < CHUNK; ++lx)
+        for (int lz = 0; lz < CHUNK; ++lz) {
+            int sum[3][3] = {}, n = 0;
             for (int dx = -R; dx <= R; ++dx)
                 for (int dz = -R; dz <= R; ++dz) {
-                    const BiomeInfo& b = BiomeData(w.BiomeAt(std::clamp(x + dx, 0, WX - 1), std::clamp(z + dz, 0, WZ - 1)));
+                    const BiomeInfo& b = BiomeData(area[lx + R + dx][lz + R + dz]);
                     uint32_t cols[3] = {b.grass, b.foliage, b.water};
                     for (int k = 0; k < 3; ++k)
                         for (int ch = 0; ch < 3; ++ch) sum[k][ch] += (cols[k] >> (16 - 8 * ch)) & 0xFF;
                     ++n;
                 }
-            auto pack = [&](int k) { return (uint32_t)((sum[k][0] / n) << 16 | (sum[k][1] / n) << 8 | (sum[k][2] / n)); };
-            size_t i = World::Col(x, z);
-            w.grassColor[i] = pack(0); w.foliageColor[i] = pack(1); w.waterColor[i] = pack(2);
+            auto packc = [&](int k) { return (uint32_t)((sum[k][0] / n) << 16 | (sum[k][1] / n) << 8 | (sum[k][2] / n)); };
+            const int i = Chunk::Col(lx, lz);
+            c.biome[i] = area[lx + R][lz + R];
+            c.grass[i] = packc(0); c.foliage[i] = packc(1); c.water[i] = packc(2);
         }
 }
 
-inline void Generate(World& w, uint32_t seed) {
-    w.seed = seed;
-    ClimateNoise noise(seed);
-    std::vector<int> heights((size_t)WX * WZ);
-
-    std::vector<double> details((size_t)WX * WZ);
-    for (int x = 0; x < WX; ++x)
-        for (int z = 0; z < WZ; ++z) {
-            Climate c = noise.At(x, z);
-            int h;
-            uint8_t biome;
-            ShapeColumn(c, h, biome);
-            heights[World::Col(x, z)] = h;
-            w.biome[World::Col(x, z)] = biome;
-            details[World::Col(x, z)] = c.detail;
+inline void ComputeChunkTops(Chunk& c) {
+    for (int lx = 0; lx < CHUNK; ++lx)
+        for (int lz = 0; lz < CHUNK; ++lz) {
+            int y = WY - 1;
+            while (y >= 0 && !BlocksSky(c.blocks[Chunk::Idx(lx, y, lz)])) --y;
+            c.top[Chunk::Col(lx, lz)] = (int16_t)y;
         }
-    auto heightAt = [&](int x, int z) { return heights[World::Col(std::clamp(x, 0, WX - 1), std::clamp(z, 0, WZ - 1))]; };
+}
 
-    for (int x = 0; x < WX; ++x)
-    for (int z = 0; z < WZ; ++z) {
-        const int h = heights[World::Col(x, z)];
-        const uint8_t biome = w.biome[World::Col(x, z)];
-        Climate c;
-        c.detail = details[World::Col(x, z)];
+// Stage 1: ground, water and caves. Uses only the seed, so it can run for
+// any chunk in any order.
+inline void GenerateTerrain(World& w, Chunk& c) {
+    ClimateNoise noise(w.seed);
+    ComputeChunkBiomes(noise, c);
+    // Heights for the chunk plus a 1-column border (for slopes)
+    int heights[CHUNK + 2][CHUNK + 2];
+    double details[CHUNK + 2][CHUNK + 2];
+    for (int i = 0; i < CHUNK + 2; ++i)
+        for (int k = 0; k < CHUNK + 2; ++k) {
+            Climate cl = noise.At(c.cx * CHUNK + i - 1, c.cz * CHUNK + k - 1);
+            uint8_t b;
+            ShapeColumn(cl, heights[i][k], b);
+            details[i][k] = cl.detail;
+        }
+
+    for (int lx = 0; lx < CHUNK; ++lx)
+    for (int lz = 0; lz < CHUNK; ++lz) {
+        const int x = c.cx * CHUNK + lx, z = c.cz * CHUNK + lz;
+        const int h = heights[lx + 1][lz + 1];
+        const double detail = details[lx + 1][lz + 1];
+        const uint8_t biome = c.biome[Chunk::Col(lx, lz)];
         // Steepness: how far the ground drops to the lowest neighbour
-        const int slope = h - std::min(std::min(heightAt(x + 1, z), heightAt(x - 1, z)), std::min(heightAt(x, z + 1), heightAt(x, z - 1)));
+        const int slope = h - std::min(std::min(heights[lx + 2][lz + 1], heights[lx][lz + 1]),
+                                       std::min(heights[lx + 1][lz + 2], heights[lx + 1][lz]));
 
         // Surface layers: what the top few blocks are made of
         uint8_t top = GRASS, under = DIRT;
@@ -1028,7 +1180,7 @@ inline void Generate(World& w, uint32_t seed) {
             case OCEAN: case FROZEN_OCEAN: top = under = SAND; break;
             case SWAMP: if (h < SEA_LEVEL) top = DIRT; break;      // muddy pools, no sand
             case MOUNTAINS:
-                if (h > 84 + (int)(c.detail * 6)) { top = under = STONE; depth = 1; }   // bare rock up high
+                if (h > 84 + (int)(detail * 6)) { top = under = STONE; depth = 1; }   // bare rock up high
                 break;
             default: if (wet) top = under = SAND; break;
         }
@@ -1036,44 +1188,72 @@ inline void Generate(World& w, uint32_t seed) {
         if (slope >= 3 && top != SAND) { top = under = STONE; depth = 1; }
         if (top == GRASS && h < SEA_LEVEL) top = DIRT;               // grass doesn't grow underwater
 
+        uint8_t* col = &c.blocks[Chunk::Idx(lx, 0, lz)];
         for (int y = 0; y < h; ++y) {
             uint8_t block;
             if (y == 0) block = BEDROCK;
-            else if (y <= 4 && Hash01(x, y, z, seed) < (5 - y) / 5.0) block = BEDROCK;
+            else if (y <= 4 && Hash01(x, y, z, w.seed) < (5 - y) / 5.0) block = BEDROCK;
             else if (y < h - depth) block = STONE;
             else if (y < h - 1)     block = under;
             else                    block = top;
-            w.SetRaw(x, y, z, block);
+            col[y] = block;
         }
         // Snow-capped peaks
-        if (biome == MOUNTAINS && h > 102 + (int)(c.detail * 6))
-            for (int y = h - 2; y < h; ++y) w.SetRaw(x, y, z, SNOW_BLOCK);
-        for (int y = h; y < SEA_LEVEL; ++y) w.SetRaw(x, y, z, WATER);
-        if (BiomeData(biome).snowy && h < SEA_LEVEL) w.SetRaw(x, SEA_LEVEL - 1, z, ICE);   // frozen over
+        if (biome == MOUNTAINS && h > 102 + (int)(detail * 6))
+            for (int y = h - 2; y < h; ++y) col[y] = SNOW_BLOCK;
+        for (int y = h; y < SEA_LEVEL; ++y) col[y] = WATER;
+        if (BiomeData(biome).snowy && h < SEA_LEVEL) col[SEA_LEVEL - 1] = ICE;   // frozen over
     }
-    BlendBiomeColors(w);
 
-    CarveCaves(w, seed);   // caves first, so ores show in the cave walls
-    PlaceOres(w, seed);
+    CarveCavesInto(w, c);
+    c.stage = STAGE_TERRAIN;
+    c.modified = true;
+}
+
+// Which flower grows in a patch: patches are 8x8 areas, each with one kind
+inline uint8_t FlowerFor(uint8_t biome, int x, int z, uint32_t seed) {
+    double k = Hash01(x >> 3, 31, z >> 3, seed + 23);
+    switch (biome) {
+        case SWAMP:        return BLUE_ORCHID;
+        case FOREST: case BIRCH_FOREST:
+            return k < 0.4 ? DANDELION : (k < 0.8 ? POPPY : ALLIUM);
+        default:
+            return k < 0.3 ? DANDELION : k < 0.55 ? POPPY : k < 0.7 ? AZURE_BLUET : k < 0.85 ? OXEYE_DAISY : CORNFLOWER;
+    }
+}
+
+// Stage 2: ores, trees, cactus, grass and flowers, snow. Trees reach into
+// neighbouring chunks, so all 8 neighbours must exist first.
+inline void DecorateChunk(World& w, Chunk& c) {
+    const uint32_t seed = w.seed;
+    ClimateNoise noise(seed);
+    PlaceOresIn(w, c);
+
+    // The ground height of each column (the first air block)
+    int ground[CHUNK][CHUNK];
+    for (int lx = 0; lx < CHUNK; ++lx)
+        for (int lz = 0; lz < CHUNK; ++lz) {
+            int y = WY - 1;
+            while (y > 0 && c.blocks[Chunk::Idx(lx, y, lz)] == AIR) --y;
+            ground[lx][lz] = y + 1;
+        }
 
     // Trees and cactus: each biome has its own mix and density
-    for (int x = 3; x < WX - 3; ++x)
-    for (int z = 3; z < WZ - 3; ++z) {
-        int h = heights[World::Col(x, z)];
-        uint8_t ground = w.Get(x, h - 1, z);
+    for (int lx = 0; lx < CHUNK; ++lx)
+    for (int lz = 0; lz < CHUNK; ++lz) {
+        const int x = c.cx * CHUNK + lx, z = c.cz * CHUNK + lz, h = ground[lx][lz];
+        uint8_t below = w.Get(x, h - 1, z);
         double roll = Hash01(x, 0, z, seed + 11), pick = Hash01(x, 7, z, seed + 19);
-        switch (w.biome[World::Col(x, z)]) {
-            case DESERT:
-                if (ground == SAND && roll < 0.006) PlaceCactus(w, x, h, z, seed);
-                break;
-            case PLAINS:       if (ground == GRASS && roll < 0.0025) PlaceOakTree(w, x, h, z, seed); break;
-            case FOREST:       if (ground == GRASS && roll < 0.035) PlaceOakTree(w, x, h, z, seed, pick < 0.2); break;
-            case BIRCH_FOREST: if (ground == GRASS && roll < 0.03) PlaceOakTree(w, x, h, z, seed, true); break;
-            case TAIGA:        if (ground == GRASS && roll < 0.03) PlaceSpruceTree(w, x, h, z, seed); break;
-            case SNOWY_PLAINS: if (ground == GRASS && roll < 0.003) PlaceSpruceTree(w, x, h, z, seed); break;
-            case SWAMP:        if (ground == GRASS && roll < 0.012) PlaceOakTree(w, x, h, z, seed); break;
+        switch (c.biome[Chunk::Col(lx, lz)]) {
+            case DESERT:       if (below == SAND && roll < 0.006) PlaceCactus(w, x, h, z, seed); break;
+            case PLAINS:       if (below == GRASS && roll < 0.0025) PlaceOakTree(w, x, h, z, seed); break;
+            case FOREST:       if (below == GRASS && roll < 0.035) PlaceOakTree(w, x, h, z, seed, pick < 0.2); break;
+            case BIRCH_FOREST: if (below == GRASS && roll < 0.03) PlaceOakTree(w, x, h, z, seed, true); break;
+            case TAIGA:        if (below == GRASS && roll < 0.03) PlaceSpruceTree(w, x, h, z, seed); break;
+            case SNOWY_PLAINS: if (below == GRASS && roll < 0.003) PlaceSpruceTree(w, x, h, z, seed); break;
+            case SWAMP:        if (below == GRASS && roll < 0.012) PlaceOakTree(w, x, h, z, seed); break;
             case MOUNTAINS:
-                if (ground == GRASS && roll < 0.006) {
+                if (below == GRASS && roll < 0.006) {
                     if (pick < 0.6) PlaceSpruceTree(w, x, h, z, seed); else PlaceOakTree(w, x, h, z, seed);
                 }
                 break;
@@ -1081,20 +1261,110 @@ inline void Generate(World& w, uint32_t seed) {
         }
     }
 
+    // Grass, ferns and flowers on open grass; dead bushes in the desert
+    for (int lx = 0; lx < CHUNK; ++lx)
+    for (int lz = 0; lz < CHUNK; ++lz) {
+        const int x = c.cx * CHUNK + lx, z = c.cz * CHUNK + lz, h = ground[lx][lz];
+        if (w.Get(x, h, z) != AIR) continue;
+        const uint8_t below = w.Get(x, h - 1, z), biome = c.biome[Chunk::Col(lx, lz)];
+        const double roll = Hash01(x, 9, z, seed + 21);
+        const bool patch = Hash01(x >> 3, 33, z >> 3, seed + 24) < 0.35;   // flowers grow in patches
+        uint8_t plant = AIR;
+        if (below == GRASS) {
+            switch (biome) {
+                case PLAINS:
+                    if (roll < 0.22) plant = SHORT_GRASS;
+                    else if (patch && roll < 0.30) plant = FlowerFor(biome, x, z, seed);
+                    break;
+                case FOREST: case BIRCH_FOREST:
+                    if (roll < 0.09) plant = SHORT_GRASS;
+                    else if (patch && roll < 0.12) plant = FlowerFor(biome, x, z, seed);
+                    break;
+                case TAIGA:
+                    if (roll < 0.08) plant = FERN;
+                    else if (roll < 0.12) plant = SHORT_GRASS;
+                    break;
+                case SWAMP:
+                    if (roll < 0.08) plant = SHORT_GRASS;
+                    else if (patch && roll < 0.10) plant = BLUE_ORCHID;
+                    break;
+                case MOUNTAINS:
+                    if (roll < 0.06) plant = SHORT_GRASS;
+                    else if (roll < 0.07) plant = FERN;
+                    break;
+                case BEACH:
+                    if (roll < 0.03) plant = SHORT_GRASS;
+                    break;
+                default: break;
+            }
+        } else if (below == SAND && biome == DESERT && roll < 0.006) {
+            plant = DEAD_BUSH;
+        }
+        if (plant != AIR) w.SetRaw(x, h, z, plant);
+    }
+
     // A thin layer of snow on everything in snowy places (and up the mountains)
-    for (int x = 0; x < WX; ++x)
-        for (int z = 0; z < WZ; ++z) {
+    for (int lx = 0; lx < CHUNK; ++lx)
+        for (int lz = 0; lz < CHUNK; ++lz) {
             int y = WY - 1;
-            while (y > 0 && w.Get(x, y, z) == AIR) --y;
-            uint8_t b = w.Get(x, y, z);
-            bool snowy = BiomeData(w.biome[World::Col(x, z)]).snowy ||
-                         (w.biome[World::Col(x, z)] == MOUNTAINS && y >= 98);
-            if (snowy && y + 1 < WY && (Info(b).opaque || IsLeaves(b)) && b != ICE) w.SetRaw(x, y + 1, z, SNOW);
+            while (y > 0 && c.blocks[Chunk::Idx(lx, y, lz)] == AIR) --y;
+            uint8_t b = c.blocks[Chunk::Idx(lx, y, lz)];
+            uint8_t biome = c.biome[Chunk::Col(lx, lz)];
+            bool snowy = BiomeData(biome).snowy || (biome == MOUNTAINS && y >= 98);
+            if (snowy && y + 1 < WY && (Info(b).opaque || IsLeaves(b)) && b != ICE) c.blocks[Chunk::Idx(lx, y + 1, lz)] = SNOW;
         }
 
-    for (int x = 0; x < WX; ++x)
-        for (int z = 0; z < WZ; ++z) w.RecomputeTop(x, z);
-    RelightAll(w);
+    c.stage = STAGE_DECORATED;
+    c.modified = true;
+}
+
+// Are all 8 neighbours of a chunk at least at this stage?
+inline bool NeighboursAt(const World& w, int cx, int cz, uint8_t stage) {
+    for (int dx = -1; dx <= 1; ++dx)
+        for (int dz = -1; dz <= 1; ++dz) {
+            if (!dx && !dz) continue;
+            const Chunk* n = w.GetChunk(cx + dx, cz + dz);
+            if (!n || n->stage < stage) return false;
+        }
+    return true;
+}
+
+// Generates, decorates and lights every chunk touching the block area
+// [x0..x1] x [z0..z1] (tests and tools; the game streams chunks instead)
+inline void GenerateArea(World& w, uint32_t seed, int x0, int z0, int x1, int z1) {
+    w.seed = seed;
+    const int cx0 = ChunkCoord(x0), cz0 = ChunkCoord(z0), cx1 = ChunkCoord(x1), cz1 = ChunkCoord(z1);
+    for (int cx = cx0 - 1; cx <= cx1 + 1; ++cx)
+        for (int cz = cz0 - 1; cz <= cz1 + 1; ++cz)
+            if (!w.GetChunk(cx, cz)) GenerateTerrain(w, w.EnsureChunk(cx, cz));
+    for (int cx = cx0; cx <= cx1; ++cx)
+        for (int cz = cz0; cz <= cz1; ++cz) {
+            Chunk& c = *w.GetChunk(cx, cz);
+            if (c.stage < STAGE_DECORATED) DecorateChunk(w, c);
+        }
+    for (auto& kv : w.chunks) ComputeChunkTops(*kv.second);
+    RelightBox(w, cx0 * CHUNK - 16, 0, cz0 * CHUNK - 16, cx1 * CHUNK + 31, WY - 1, cz1 * CHUNK + 31);
+    for (int cx = cx0; cx <= cx1; ++cx)
+        for (int cz = cz0; cz <= cz1; ++cz) w.GetChunk(cx, cz)->lit = true;
+}
+
+// A good place for the world spawn: the first dry, open ground spiralling out
+// from 0,0 (read from the climate, so no chunks are needed)
+inline void FindSpawnColumn(uint32_t seed, int& sx, int& sz) {
+    ClimateNoise noise(seed);
+    for (int r = 0; r < 2048; r += 4)
+        for (int dx = -r; dx <= r; dx += 4)
+            for (int dz = -r; dz <= r; dz += 4) {
+                if (std::max(std::abs(dx), std::abs(dz)) != r) continue;
+                int h;
+                uint8_t b;
+                ShapeColumn(noise.At(dx, dz), h, b);
+                if (h >= SEA_LEVEL + 1 && (b == PLAINS || b == FOREST || b == BIRCH_FOREST || b == TAIGA || b == SNOWY_PLAINS || b == DESERT)) {
+                    sx = dx; sz = dz;
+                    return;
+                }
+            }
+    sx = sz = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,15 +1544,16 @@ inline bool TouchesBlock(const World& w, const AABB& box, uint8_t type) {
     return false;
 }
 
-inline void Spawn(const World& w, Player& p) {
-    // Spiral out from the world center until we find dry land
-    int cx = WX / 2, cz = WZ / 2;
-    for (int r = 0; r < WX / 2; ++r)
+// Puts the player on open, dry ground near (cx, cz). The chunks there must
+// be loaded; returns false if no spot was found.
+inline bool SpawnNear(const World& w, Player& p, int cx, int cz, int radius = 24) {
+    for (int r = 0; r <= radius; ++r)
         for (int dx = -r; dx <= r; ++dx)
             for (int dz = -r; dz <= r; ++dz) {
                 if (std::max(std::abs(dx), std::abs(dz)) != r) continue;
                 int x = cx + dx, z = cz + dz, y = WY - 1;
-                while (y > 0 && (w.Get(x, y, z) == AIR || w.Get(x, y, z) == SNOW)) --y;
+                if (!w.Loaded(x, z)) continue;
+                while (y > 0 && (w.Get(x, y, z) == AIR || w.Get(x, y, z) == SNOW || IsPlant(w.Get(x, y, z)))) --y;
                 uint8_t b = w.Get(x, y, z);
                 if (b != GRASS && b != SAND) continue;   // not water, trees, or the bottom of a cave mouth
                 bool clear = true;   // no tree canopy within 2 blocks: spawn in the open
@@ -1295,9 +1566,9 @@ inline void Spawn(const World& w, Player& p) {
                 p.vx = p.vy = p.vz = 0;
                 p.flying = false;
                 p.fallDistance = 0;
-                return;
+                return true;
             }
-    p.x = cx + 0.5; p.y = WY - 10; p.z = cz + 0.5;
+    return false;
 }
 
 // One 50 ms game tick for the player. Mirrors LivingEntity.aiStep + travel.
@@ -1435,8 +1706,8 @@ inline void TickPlayer(const World& w, Player& p, const PlayerInput& in) {
         p.exhaustion = std::min(p.exhaustion, MAX_EXHAUSTION);
     }
 
-    // Fell into the void: creative pops back to spawn, survival takes void damage
-    if (p.y < -64.0 && p.creative) Spawn(w, p);
+    // Fell into the void: creative floats back up, survival takes void damage
+    if (p.y < -64.0 && p.creative) { p.y = WY + 4; p.py = p.y; p.vy = 0; }
 }
 
 inline bool EyesInWater(const World& w, const Player& p) {
@@ -1494,8 +1765,8 @@ inline void TickSurvival(const World& w, Player& p) {
     }
 }
 
-inline void Respawn(const World& w, Player& p) {
-    Spawn(w, p);
+// Back to full health; the caller moves the player to the spawn point
+inline void Respawn(Player& p) {
     p.health = MAX_HEALTH; p.food = MAX_FOOD; p.saturation = START_SATURATION;
     p.exhaustion = 0; p.foodTimer = 0; p.air = MAX_AIR;
     p.hurtTime = p.invulnerable = 0;
@@ -1524,6 +1795,10 @@ inline AABB BlockBox(uint8_t b, int x, int y, int z) {
         case WALL_TORCH_NZ: return {x + 5.5 * p, y + 3 * p, z + 11 * p, x + 10.5 * p, y + 13 * p, z + 1.0};
         case SNOW:          return {(double)x, (double)y, (double)z, x + 1.0, y + 2 * p, z + 1.0};
         case CACTUS:        return {x + p, (double)y, z + p, x + 15 * p, y + 1.0, z + 15 * p};
+        case SHORT_GRASS: case FERN: case DEAD_BUSH:
+                            return {x + 2 * p, (double)y, z + 2 * p, x + 14 * p, y + 13 * p, z + 14 * p};
+        case DANDELION: case POPPY: case CORNFLOWER: case OXEYE_DAISY: case AZURE_BLUET: case ALLIUM: case BLUE_ORCHID:
+                            return {x + 5 * p, (double)y, z + 5 * p, x + 11 * p, y + 10 * p, z + 11 * p};
         default:            return {(double)x, (double)y, (double)z, x + 1.0, y + 1.0, z + 1.0};
     }
 }
@@ -1570,7 +1845,7 @@ inline RayHit Raycast(const World& w, double ox, double oy, double oz,
     double t = 0;
     while (t <= maxDist) {
         uint8_t b = w.Get(x, y, z);
-        if (IsTorch(b) || b == SNOW || b == CACTUS) {
+        if (IsTorch(b) || b == SNOW || b == CACTUS || IsPlant(b)) {
             // Small hitbox: the ray can pass beside a torch or over thin snow
             double tt; int hx, hy, hz;
             if (RayBox(ox, oy, oz, dx, dy, dz, BlockBox(b, x, y, z), tt, hx, hy, hz) && tt <= maxDist) {
@@ -1628,6 +1903,8 @@ inline Stack BlockDrop(uint8_t b, uint8_t tool = AIR) {
     switch (b) {
         case AIR: case WATER: case BEDROCK: case GLASS: case ICE: case SNOW: return {};   // snow needs snowballs, ice melts
         case SPRUCE_LEAVES: case BIRCH_LEAVES: return {};
+        case SHORT_GRASS: case FERN: return {};
+        case DEAD_BUSH: { int n = (int)(Rand01() * 3); return n ? Stack{STICK, n} : Stack{}; }
         case GRASS:    return {DIRT, 1};
         case STONE:    return {COBBLESTONE, 1};
         case COAL_ORE:    return {COAL, 1};
@@ -1731,6 +2008,7 @@ inline void TickItems(const World& w, std::vector<ItemEntity>& items, const Play
 
     for (ItemEntity& e : items) {
         e.px = e.x; e.py = e.y; e.pz = e.z;
+        if (!w.Loaded((int)std::floor(e.x), (int)std::floor(e.z))) continue;   // asleep until its chunk loads
         ++e.age;
         if (e.pickupDelay > 0) --e.pickupDelay;
 
